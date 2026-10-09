@@ -90,20 +90,87 @@ def _ci(repo, rem):
         return None
 
 
-def issue_body(state, group, findings, rem, marker) -> str:
-    repo, sha = state["repo"], state["commit_sha"]
+def _issue_body_v1(state, group, findings, rem, marker) -> list:
+    repo, sha, c = state["repo"], state["commit_sha"], group["change"]
     confirmed = [f for f in findings if f["confidence_tier"] == "confirmed"]
-    snippets = []
+    others = [f for f in findings if f["confidence_tier"] != "confirmed" and f["status"] != "exposed"]
+    proof = group.get("proof") or {}
+    cases = (proof.get("run") or {}).get("cases", [])
+    failing = [x["name"] for x in cases if x["status"] == "fail"]
+    lines = [marker, ""]
+    if group["kind"] == "vulnerability":
+        lines += [f"**Confirmed vulnerable dependency use** · `{group['package']['name']} {group['package']['version']}` "
+                  f"({group['package']['manifest']}) · advisory severity **{c.get('severity')}**",
+                  f"**Advisory:** [{c['change_id']}]({c['source_url']})" + (f" · [{c['cve']}](https://osv.dev/vulnerability/{c['cve']})" if c.get("cve") else ""),
+                  f"**Version check:** {group['version_check']['reason']}"]
+    else:
+        lines += [f"**Confirmed breaking API change** · Stripe `{c.get('api_version')}` removes "
+                  + ", ".join(f"`{s}`" for s in c.get("removed_symbols", [])),
+                  f"**Source:** [official Stripe changelog]({c['source_url']}) · replacement: "
+                  + ", ".join(f"`{s}`" for s in c.get("added_symbols", []))]
+    lines += [f"**Scanned commit:** [`{sha[:7]}`](https://github.com/{repo}/commit/{sha})", "", "## Affected code (Semgrep, exact lines)", ""]
     for f in confirmed:
+        sg = f.get("semgrep") or {}
         code = f["code"]
         a, b = max(f["line"] - 2, code["first_line"]), min(f["end_line"] + 2, code["first_line"] + len(code["lines"]) - 1)
-        snippets.append("\n".join([f"**`{f['path']}:{f['line']}`**", _permalink(repo, sha, f["path"], a, b)]))
+        snippet = "\n".join(code["lines"][a - code["first_line"] : b - code["first_line"] + 1])
+        lines += [f"### `{f['path']}:{f['line']}`" + (f" — `{sg.get('rule_id')}`" if sg else ""),
+                  _permalink(repo, sha, f["path"], a, b), "",
+                  f"```{LANG.get(_ext(f['path']), '')}", snippet, "```",
+                  f"Vulnerable line {f['line']}: `{sg.get('matched_code', '').strip()[:160]}`", ""]
+    lines += ["## Why this is a problem", "", (confirmed[0].get("semgrep") or {}).get("message", "").strip(), ""]
+    for r in confirmed[0]["reasons"]:
+        lines.append(f"- {r}")
+    if failing:
+        lines += ["", f"**Reproduced:** {len(failing)} DriftGuard regression test(s) fail on the unpatched code at `{sha[:7]}` "
+                  f"(e.g. `{failing[0]}`), while all pre-change/existing tests pass."]
+    lines += ["", "## Recommended fix", ""]
+    if rem:
+        lines.append(f"Accepted candidate **`{rem['accepted']}`**: " + next((a["description"] for a in rem["attempts"] if a["candidate"] == rem["accepted"]), ""))
+        rejected = [a for a in rem["attempts"] if a["verdict"] == "rejected"]
+        for a in rejected:
+            lines.append(f"- Rejected `{a['candidate']}`: {a['reason'][:200]}")
+        shown = set()
+        for f in confirmed:
+            h = _hunk_for(rem.get("diff"), f)
+            if h and h not in shown:
+                shown.add(h)
+                lines += ["", f"`{f['path']}`", "```diff", h, "```"]
+        if not shown:
+            for p, h in _manifest_hunks(rem.get("diff")):
+                lines += ["", f"`{p}`", "```diff", h, "```"]
+        pr = rem["pr"]
+        lines += ["", "## Remediation PR", "",
+                  f"Draft PR #{pr['number']} ({pr['url']}), opened by "
+                  f"{'the Guild remediator agent (Guild GitHub integration)' if pr.get('executor') == 'guild' else 'DriftGuard (direct GitHub API fallback)'} "
+                  f"from a scan at `{rem['commit_sha'][:7]}`. All existing and regression tests pass on the patch; human review required."]
+    else:
+        lines.append("No verified patch yet. Upgrade past the affected range: " + ", ".join(group.get("version_check", {}).get("fixed_versions", [])))
+    if others:
+        lines += ["", "## Related locations not counted as confirmed", ""]
+        for f in others:
+            lines.append(f"- `{f['path']}:{f['line']}` — {f['confidence_tier']}: {(f.get('limitations') or [''])[0]}")
+    return lines
+
+
+def issue_body(state, group, findings, rem, marker) -> str:
+    """Original evidence-first layout (changelog source + exact Semgrep lines + embedded snippets + fix diffs),
+    followed by the structured verification table, action plan and copy-paste agent prompt."""
+    lines = _issue_body_v1(state, group, findings, rem, marker)
     c = reporting_md.context(state, group, findings, rem, (rem or {}).get("proof") or group.get("proof"),
-                             issue=None, ci=_ci(repo, rem) if rem else None)
-    c["scan_sha"], c["scan_run"] = sha, state["run_id"]
-    c["impacted"] = confirmed
+                             ci=_ci(state["repo"], rem) if rem else None)
+    c["scan_sha"], c["scan_run"] = state["commit_sha"], state["run_id"]
+    c["impacted"] = [f for f in findings if f["confidence_tier"] == "confirmed"]
     c["others"] = [f for f in findings if f["confidence_tier"] != "confirmed" and f["status"] != "exposed"]
-    return reporting_md.issue_body(c, marker, snippets)
+    if c["accepted"]:
+        lines += ["", "## Verified fix & tests", "", *reporting_md.verification_block(c)]
+    lines += ["", "## ☑️ Action plan", "", *reporting_md.action_checklist(c), "",
+              *reporting_md.details("🤖 Copy-paste prompt for an AI coding agent (Claude Code / Cursor / Copilot)",
+                                    ["```text", reporting_md.agent_prompt(c), "```"]), "",
+              "## Traceability", "", *reporting_md.traceability(c), "", "---",
+              "<sub>Filed by DriftGuard via the GitHub API (operator token). Only Semgrep-matched lines with a reproduced regression are listed "
+              "as confirmed; semantic-similarity candidates are never filed. Re-scans update this issue instead of opening a new one.</sub>"]
+    return "\n".join(lines)
 
 
 def refresh_pr_description(state, group_key, issue=None) -> dict:
