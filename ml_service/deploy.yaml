@@ -9,6 +9,10 @@ services:
     image: ghcr.io/rishit2121/driftguard-ml:0.1.0
     env:
       - DEPLOYMENT_TARGET=akash
+      # Cap torch/BLAS threads to the CPU units below; without this torch sizes its pool to the
+      # provider host's core count and gets throttled (~3.5s -> ~40ms per /embed on Akash).
+      - OMP_NUM_THREADS=2
+      - MKL_NUM_THREADS=2
       - ML_SERVICE_TOKEN=REPLACE_WITH_LONG_RANDOM_TOKEN
     expose:
       - port: 8000 # uvicorn inside the container

@@ -8,6 +8,13 @@
 Both are deterministic coded agents (`'use agent'`): no LLM decides which tool to call, and fetched text is never
 treated as instructions.
 
+## Live deployment
+
+- Workspace `rishit.agrawal121~driftguard`, agents `rishit.agrawal121~driftguard-watcher` and `rishit.agrawal121~driftguard-remediator` (published, SDK `@guildai/agents-sdk` 0.7.8).
+- Triggers: `driftguard-daily-watch` (time, daily 09:00) and `driftguard-on-push` (GitHub `push` webhook on the demo repo), both running the watcher.
+- The platform starts a watcher session on every investigation and routes PR creation through the remediator (`DRIFTGUARD_PR_EXECUTOR=guild`). The first Guild-opened PR is https://github.com/rishit2121/driftguard-demo-monorepo/pull/4.
+- Compiler notes learned while deploying: keep `run()` a thin orchestrator. String-literal object keys and object spreads inside `run()` are rejected by `@guildai/babel-plugin-agent-compiler`, so data shaping lives in plain helper functions. Chat sessions prepend a preamble to the prompt, so each agent extracts the JSON request from the text.
+
 ## Deploy
 
 ```bash
