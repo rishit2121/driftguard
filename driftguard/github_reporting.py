@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 
-from . import github, store
+from . import github, reporting_md, store
 
 LANG = {".ts": "typescript", ".js": "javascript", ".py": "python", ".java": "java", ".json": "json", ".txt": "text", ".xml": "xml"}
 LABELS = {"driftguard": "6aa8ff", "confirmed": "d73a4a", "breaking-api": "8a63d2", "vulnerability": "b60205"}
@@ -25,14 +25,17 @@ def remediation_for(state: dict, group_key: str) -> dict | None:
     """This run's remediation, else the most recent earlier run's remediation for the same change group."""
     g = state["groups"][group_key]
     if g.get("remediation"):
-        return {"run_id": state["run_id"], "commit_sha": state["commit_sha"], **g["remediation"]}
+        return {"run_id": state["run_id"], "commit_sha": state["commit_sha"], **g["remediation"], "proof": g.get("proof"),
+                "findings": [f for f in state["findings"] if f["group_key"] == group_key]}
     rows = store.client().query(
         "SELECT run_id, commit_sha, summary FROM investigations FINAL WHERE repo={r:String} AND status='complete' "
         "AND position(summary, '\"remediation\"') > 0 ORDER BY started_at DESC LIMIT 20", parameters={"r": state["repo"]}).result_rows
     for run_id, sha, summary in rows:
-        prior = (json.loads(summary).get("groups") or {}).get(group_key) or {}
+        data = json.loads(summary)
+        prior = (data.get("groups") or {}).get(group_key) or {}
         if run_id != state["run_id"] and prior.get("remediation"):
-            return {"run_id": run_id, "commit_sha": sha, **prior["remediation"]}
+            return {"run_id": run_id, "commit_sha": sha, **prior["remediation"], "proof": prior.get("proof"),
+                    "findings": [f for f in data.get("findings", []) if f["group_key"] == group_key]}
     return None
 
 
@@ -79,69 +82,47 @@ def issue_title(group) -> str:
     return f"[DriftGuard] Breaking API change: {c.get('title')} (Stripe {c.get('api_version')})"[:250]
 
 
+def _ci(repo, rem):
+    try:
+        st = github.pr_status(repo, rem["pr"]["number"])
+        return {"head_sha": st["head_sha"], "checks": st["checks"]}
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def issue_body(state, group, findings, rem, marker) -> str:
-    repo, sha, c = state["repo"], state["commit_sha"], group["change"]
+    repo, sha = state["repo"], state["commit_sha"]
     confirmed = [f for f in findings if f["confidence_tier"] == "confirmed"]
-    others = [f for f in findings if f["confidence_tier"] != "confirmed" and f["status"] != "exposed"]
-    proof = group.get("proof") or {}
-    cases = (proof.get("run") or {}).get("cases", [])
-    failing = [x["name"] for x in cases if x["status"] == "fail"]
-    lines = [marker, ""]
-    if group["kind"] == "vulnerability":
-        lines += [f"**Confirmed vulnerable dependency use** · `{group['package']['name']} {group['package']['version']}` "
-                  f"({group['package']['manifest']}) · advisory severity **{c.get('severity')}**",
-                  f"**Advisory:** [{c['change_id']}]({c['source_url']})" + (f" · [{c['cve']}](https://osv.dev/vulnerability/{c['cve']})" if c.get("cve") else ""),
-                  f"**Version check:** {group['version_check']['reason']}"]
-    else:
-        lines += [f"**Confirmed breaking API change** · Stripe `{c.get('api_version')}` removes "
-                  + ", ".join(f"`{s}`" for s in c.get("removed_symbols", [])),
-                  f"**Source:** [official Stripe changelog]({c['source_url']}) · replacement: "
-                  + ", ".join(f"`{s}`" for s in c.get("added_symbols", []))]
-    lines += [f"**Scanned commit:** [`{sha[:7]}`](https://github.com/{repo}/commit/{sha})", "", "## Affected code (Semgrep, exact lines)", ""]
+    snippets = []
     for f in confirmed:
-        sg = f.get("semgrep") or {}
         code = f["code"]
         a, b = max(f["line"] - 2, code["first_line"]), min(f["end_line"] + 2, code["first_line"] + len(code["lines"]) - 1)
-        snippet = "\n".join(code["lines"][a - code["first_line"] : b - code["first_line"] + 1])
-        lines += [f"### `{f['path']}:{f['line']}`" + (f" — `{sg.get('rule_id')}`" if sg else ""),
-                  _permalink(repo, sha, f["path"], a, b), "",
-                  f"```{LANG.get(_ext(f['path']), '')}", snippet, "```",
-                  f"Vulnerable line {f['line']}: `{sg.get('matched_code', '').strip()[:160]}`", ""]
-    lines += ["## Why this is a problem", "", (confirmed[0].get("semgrep") or {}).get("message", "").strip(), ""]
-    for r in confirmed[0]["reasons"]:
-        lines.append(f"- {r}")
-    if failing:
-        lines += ["", f"**Reproduced:** {len(failing)} DriftGuard regression test(s) fail on the unpatched code at `{sha[:7]}` "
-                  f"(e.g. `{failing[0]}`), while all pre-change/existing tests pass."]
-    lines += ["", "## Recommended fix", ""]
-    if rem:
-        lines.append(f"Accepted candidate **`{rem['accepted']}`**: " + next((a["description"] for a in rem["attempts"] if a["candidate"] == rem["accepted"]), ""))
-        rejected = [a for a in rem["attempts"] if a["verdict"] == "rejected"]
-        for a in rejected:
-            lines.append(f"- Rejected `{a['candidate']}`: {a['reason'][:200]}")
-        shown = set()
-        for f in confirmed:
-            h = _hunk_for(rem.get("diff"), f)
-            if h and h not in shown:
-                shown.add(h)
-                lines += ["", f"`{f['path']}`", "```diff", h, "```"]
-        if not shown:
-            for p, h in _manifest_hunks(rem.get("diff")):
-                lines += ["", f"`{p}`", "```diff", h, "```"]
-        pr = rem["pr"]
-        lines += ["", "## Remediation PR", "",
-                  f"Draft PR #{pr['number']} ({pr['url']}), opened by "
-                  f"{'the Guild remediator agent (Guild GitHub integration)' if pr.get('executor') == 'guild' else 'DriftGuard (direct GitHub API fallback)'} "
-                  f"from a scan at `{rem['commit_sha'][:7]}`. All existing and regression tests pass on the patch; human review required."]
-    else:
-        lines.append("No verified patch yet. Upgrade past the affected range: " + ", ".join(group.get("version_check", {}).get("fixed_versions", [])))
-    if others:
-        lines += ["", "## Related locations not counted as confirmed", ""]
-        for f in others:
-            lines.append(f"- `{f['path']}:{f['line']}` — {f['confidence_tier']}: {(f.get('limitations') or [''])[0]}")
-    lines += ["", "---", "<sub>Filed by DriftGuard via the GitHub API (operator token). Only Semgrep-matched lines with a reproduced "
-              "regression are listed as confirmed; semantic-similarity candidates are never filed. Re-scans update this issue instead of opening a new one.</sub>"]
-    return "\n".join(lines)
+        snippets.append("\n".join([f"**`{f['path']}:{f['line']}`**", _permalink(repo, sha, f["path"], a, b)]))
+    c = reporting_md.context(state, group, findings, rem, (rem or {}).get("proof") or group.get("proof"),
+                             issue=None, ci=_ci(repo, rem) if rem else None)
+    c["scan_sha"], c["scan_run"] = sha, state["run_id"]
+    c["impacted"] = confirmed
+    c["others"] = [f for f in findings if f["confidence_tier"] != "confirmed" and f["status"] != "exposed"]
+    return reporting_md.issue_body(c, marker, snippets)
+
+
+def refresh_pr_description(state, group_key, issue=None) -> dict:
+    """Rewrite an existing DriftGuard PR description in place (code, commits and authorship untouched)."""
+    group = {**state["groups"][group_key], "key": group_key}
+    rem = remediation_for(state, group_key)
+    if not rem:
+        return {"skipped": "no remediation PR"}
+    repo = state["repo"]
+    c = reporting_md.context(state, group, rem.get("findings") or [], rem, rem.get("proof"), issue=issue, ci=_ci(repo, rem),
+                             latest={"run_id": state["run_id"], "commit_sha": state["commit_sha"]})
+    note = ("Opened by the **Guild remediator agent** through Guild's GitHub integration." if rem["pr"].get("executor") == "guild"
+            else "Opened by **DriftGuard** via the direct GitHub API fallback (operator token).")
+    from datetime import datetime, timezone
+    refreshed = (f"Description refreshed by DriftGuard via the GitHub API (operator token) on {datetime.now(timezone.utc).strftime('%Y-%m-%d')}. "
+                 "Code, commits and PR authorship are unchanged.")
+    body = reporting_md.pr_body(c, note, refreshed)
+    pr = github.gh("PATCH", f"/repos/{repo}/pulls/{rem['pr']['number']}", json={"body": body})
+    return {"pr": pr["number"], "url": pr["html_url"], "chars": len(body)}
 
 
 def ensure_labels(repo):
