@@ -33,7 +33,7 @@ function setNav(name) {
 async function services() {
   try {
     const s = await api('/api/status');
-    const pill = (label, ok, title, warn) => `<span class="svc ${ok ? (warn ? 'warn' : 'ok') : 'bad'}" title="${esc(title)}">${esc(label)}</span>`;
+    const pill = (label, ok, title, warn) => `<span class="svc ${ok ? (warn ? 'warn' : 'ok') : 'bad'}" title="${esc(label)}: ${esc(title)}">${esc(label.split(' ')[0])}</span>`;
     const ml = s.ml;
     document.getElementById('services').innerHTML = [
       pill(`Guild ${s.guild.authenticated ? '' : '(not authorized)'}`, s.guild.ok, s.guild.detail || '', !s.guild.authenticated),
@@ -52,118 +52,172 @@ async function latestRun() {
 
 
 // ------------------------------------------------------------------------------------------- Overview (demo landing)
-function evidenceCards(ev, run, headline) {
-  const g = ev.guild, a = ev.akash, c = ev.clickhouse, s = ev.semgrep;
-  const pr = headline?.remediation?.pr;
-  return `<div class="grid g5">
-    <div class="ev-card"><h4>Guild.ai ${g.status === 'DONE' ? '<span class="pass">✓</span>' : ['RUNNING', 'STARTING'].includes(g.status) ? '<span class="spin"></span>' : '<span class="fail">—</span>'}</h4>
-      ${['RUNNING', 'STARTING'].includes(g.status) ? `<div>Watcher session ${g.session_url ? `<a href="${esc(g.session_url)}" target="_blank">running ↗</a>` : 'starting…'}</div>
-        <div class="muted">Guild agent is fetching Stripe + OSV and reading lockfiles via Guild's GitHub integration; evidence attaches when it finishes.</div>`
-      : g.session_url ? `<div>Watcher session <a href="${esc(g.session_url)}" target="_blank">trace ↗</a></div>
-      <div class="muted">${g.tool_calls.length} tool calls · ${esc(g.elapsed_s)}s · pinned <code>${esc(short(g.commit_sha))}</code> ${g.sha_agrees ? '<span class="pass">= platform</span>' : ''}</div>
-      <div class="muted">Stripe sha256 ${g.stripe_hash_agrees ? '<span class="pass">matches</span>' : 'n/a'}</div>` : '<div class="muted">no watcher session in this run</div>'}
-      ${pr && pr.executor === 'guild' ? `<div style="margin-top:4px">PR <a href="${esc(pr.url)}" target="_blank">#${pr.number}</a> opened by Guild remediator</div>` : ''}</div>
-    <div class="ev-card"><h4>Akash ${a.health?.deployment === 'akash' ? '<span class="pass">✓</span>' : `<span class="fail">${esc(a.health?.deployment || 'down')}</span>`}</h4>
-      <div>deployment: <b>${esc(a.health?.deployment)}</b> · pod <code>${esc((a.health?.host || '').slice(-11))}</code></div>
-      <div class="muted">${a.calls} inference calls · server ${esc(a.median_server_ms)} ms · round trip ${esc(a.median_roundtrip_ms)} ms (median)</div>
-      <div class="muted small" style="overflow-wrap:anywhere">${esc(a.health?.model_version)}</div></div>
-    <div class="ev-card"><h4>ClickHouse <span class="pass">✓</span></h4>
-      <div>cosineDistance query <b>${esc(c.vector_stats?.elapsed_ms)} ms</b></div>
-      <div class="muted">${esc(c.vector_stats?.rows_read)} rows read · ${c.candidates} filtered candidates</div>
-      <div><a href="#/timeline/${esc(run.run_id)}">analytics &amp; timeline →</a></div></div>
-    <div class="ev-card"><h4>Semgrep <span class="pass">✓</span></h4>
-      <div>${esc(s.results)} matches · ${esc(s.elapsed_ms)} ms</div>
-      <div class="muted">v${esc(s.version)} · 5 tested rules (ruleid/ok)</div>
-      <div class="muted">typed rule ignores look-alike fields</div></div>
-    <div class="ev-card"><h4>GitHub <span class="pass">✓</span></h4>
-      <div>scanned <a href="https://github.com/${esc(run.repo)}/commit/${esc(run.commit_sha)}" target="_blank"><code>${esc(short(run.commit_sha))}</code></a></div>
-      <div id="ciBox" class="muted">CI: loading…</div>
-      <div class="muted">draft PRs only · human merges</div></div>
-  </div>`;
-}
-
-function rejectSummary(reason) {
-  const m = (reason || '').match(/^tests failed: (.*)$/s);
-  if (!m) return reason;
-  const failed = m[1].split('; ');
-  return `${failed.length} tests failed, e.g. "${failed[0]}"`;
-}
-
-function headlineCard(run, h) {
-  if (!h) return '';
-  const rem = h.remediation;
-  const confirmed = h.locations.filter((l) => l.tier === 'confirmed');
-  const risk = h.locations.filter((l) => l.tier !== 'confirmed');
-  return `<div class="card" style="margin-top:14px">
-    <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:8px">
-      <div class="row">${prov('stripe')}<div><b style="font-size:16px">${esc(h.title)}</b>
-        <div class="small muted">Stripe API <code>2025-03-31.basil</code> · <a href="${esc(h.source_url)}" target="_blank">official changelog ↗</a></div></div></div>
-      <div>${h.issue ? `<a class="chip" style="color:var(--bad)" href="${esc(h.issue.url)}" target="_blank">issue #${h.issue.number} ↗</a>` : ''} ${tier('confirmed')}</div>
-    </div>
-    <div class="flow" style="margin-top:12px">
-      <div class="step"><div class="lbl">1 · Exact code affected (Semgrep)</div>
-        ${confirmed.map((l) => `<div><a class="mono small" href="#/finding/${esc(run.run_id)}/${esc(l.finding_id)}">${esc(l.path.replace('apps/billing-ts/src/', ''))}:${l.line}</a></div>`).join('')}
-        ${risk.map((l) => `<div class="small"><a class="mono" href="#/finding/${esc(run.run_id)}/${esc(l.finding_id)}">${esc(l.path.replace('apps/billing-ts/src/', ''))}:${l.line}</a> <span class="tier upgrade_risk">upgrade risk</span></div>`).join('')}
-        <div class="small muted" style="margin-top:4px">legacy endpoint pinned to <code>acacia</code>: not called broken</div></div>
-      <div class="arrow">→</div>
-      <div class="step"><div class="lbl">2 · Proof on unpatched code</div>
-        <div class="score"><span class="fail">${h.proof.fail} FAIL</span> <span class="muted" style="font-size:14px">post-basil fixtures</span></div>
-        <div class="score" style="font-size:16px"><span class="pass">${h.proof.pass} PASS</span> <span class="muted" style="font-size:13px">pre-basil + existing tests</span></div>
-        <div class="small muted">recorded pre/post fixtures replayed through production code</div></div>
-      <div class="arrow">→</div>
-      <div class="step"><div class="lbl">3 · Verified fix → draft PR</div>
-        ${rem ? `${rem.attempts.map((a) => `<div class="${a.verdict === 'accepted' ? 'accept' : 'reject'}"><b>${esc(a.verdict.toUpperCase())}</b> <code>${esc(a.candidate)}</code>
-            <div class="muted small">${esc(a.verdict === 'accepted' ? a.reason : rejectSummary(a.reason))}</div></div>`).join('')}
-          ${rem.after ? `<div class="small" style="margin-top:4px">After patch: <span class="pass">${rem.after.pass}/${rem.after.pass + rem.after.fail} PASS</span></div>` : ''}
-          <div style="margin-top:6px"><a href="${esc(rem.pr.url)}" target="_blank"><b>Draft PR #${rem.pr.number} ↗</b></a> <span class="small muted">by ${esc(rem.pr.executor === 'guild' ? 'Guild remediator agent' : 'direct GitHub fallback')}</span></div>
-          <div class="small muted">from ${esc(rem.source)}</div>`
-        : '<div class="muted small">No remediation yet for this change.</div>'}</div>
-    </div></div>`;
-}
-
-function securityCards(run, sec) {
-  return `<div class="grid g3" style="margin-top:14px">${sec.map((g) => {
-    const rem = g.remediation;
-    const rejected = rem ? rem.attempts.filter((a) => a.verdict === 'rejected') : [];
-    const loc = g.locations.filter((l) => l.status !== 'exposed');
-    return `<div class="card"><div class="row" style="justify-content:space-between"><div class="row">${prov('osv')}<div><b>${esc(g.cve || g.change_id)}</b>
-        <div class="small muted"><code>${esc(g.package)} ${esc(g.installed)}</code> · ${esc(langOf(loc[0]?.path))}</div></div></div>${tier(loc[0]?.tier)}</div>
-      <div style="margin-top:8px">${loc.map((l) => `<a class="mono small" href="#/finding/${esc(run.run_id)}/${esc(l.finding_id)}">${esc(l.path.split('/').slice(-2).join('/'))}:${l.line}</a>`).join(' · ')}</div>
-      ${g.proof.status === 'reproduced' ? `<div class="small" style="margin-top:6px">Proof: <span class="fail">${g.proof.fail} FAIL</span> on unpatched code (inert probe)</div>` : `<div class="small muted" style="margin-top:6px">Candidate use site only: exploitability not claimed</div>`}
-      ${rejected.map((a) => `<div class="reject"><b>REJECTED</b> <code>${esc(a.candidate)}</code> <span class="muted small">${esc(a.reason.slice(0, 90))}</span></div>`).join('')}
-      ${rem ? `<div class="accept"><b>ACCEPTED</b> <code>${esc(rem.accepted)}</code>${rem.upgrade_plan?.minimal_fix_remaining ? `<div class="muted small">minimal fix ${esc(rem.upgrade_plan.minimal_fix)} still has ${rem.upgrade_plan.minimal_fix_remaining} advisories, so not chosen</div>` : ''}</div>
-        <div class="small"><a href="${esc(rem.pr.url)}" target="_blank">Draft PR #${rem.pr.number} ↗</a> <span class="muted">(${esc(rem.source)})</span>
-          ${g.issue ? ` · <a href="${esc(g.issue.url)}" target="_blank">issue #${g.issue.number} ↗</a>` : ''}</div>` : ''}
-    </div>`;
-  }).join('')}</div>`;
-}
-
 const EXTRA_NEG = {
   'E-constant': 'Constant Log4j message (RequestAudit.java:26) must not be flagged',
   shopify: '40 live Shopify changelog entries, repo has no Shopify usage: no alerts',
   'stripe-sdk-osv': 'stripe-node 18.0.0 has no OSV advisories: no CVE alert',
 };
+const STAGE_LABEL = {
+  repo_snapshot: 'Pinning commit', inventory: 'Reading lockfiles', source_fetch: 'Fetching official sources',
+  guild_watcher: 'Guild agent investigating', ml_health: 'Connecting to Akash', doc_index: 'Embedding changes (Akash)',
+  code_index: 'Embedding code (Akash)', vector_retrieval: 'ClickHouse vector search', semgrep: 'Semgrep scan',
+  evidence_combine: 'Combining evidence', regression_proof: 'Running regression tests', ml_rank: 'Ranking (Akash)',
+  ml_classify: 'Classifying candidates (Akash)', quarantine: 'Quarantining untrusted text',
+  github_issue: 'Updating GitHub issues', pr_annotations: 'Annotating PRs',
+};
+const EXPECTED_STAGES = 24;
+
+function rejectSummary(reason) {
+  const m = (reason || '').match(/^tests failed: (.*)$/s);
+  if (!m) return reason;
+  return `${m[1].split('; ').length} tests failed`;
+}
+const shortPath = (p) => (p || '').split('/').slice(-2).join('/');
+const prNum = (rem) => rem?.pr?.number;
+
+function heroMetrics(inv, o) {
+  const fs = inv.findings || [];
+  const confirmed = fs.filter((f) => f.confidence_tier === 'confirmed');
+  const review = fs.filter((f) => ['needs_review', 'unverified', 'potentially_affected', 'upgrade_risk'].includes(f.status));
+  const files = new Set(confirmed.map((f) => f.path));
+  const prs = new Set([o.headline, ...(o.security || [])].map((g) => prNum(g?.remediation)).filter(Boolean));
+  const tile = (n, label, cls, hint) => `<div class="metric" title="${esc(hint)}"><div class="mv ${cls}">${n}</div><div class="ml">${esc(label)}</div></div>`;
+  return `<div class="metrics">
+    ${tile(confirmed.length, 'Confirmed findings', 'red', 'Exact Semgrep match + affected version + regression test reproduced the failure')}
+    ${tile(review.length, 'Needs review', 'amber', 'Candidates, upgrade risks, unverified versions and insecure patterns: shown, never auto-fixed')}
+    ${tile(files.size, 'Files affected', '', 'Distinct files with a confirmed finding')}
+    ${tile(prs.size, 'Verified fixes', 'green', 'Draft PRs whose patch passed every existing and regression test')}
+  </div>`;
+}
+
+function featured(run, h) {
+  if (!h) return '';
+  const rem = h.remediation;
+  const confirmed = h.locations.filter((l) => l.tier === 'confirmed');
+  const risk = h.locations.filter((l) => l.tier === 'upgrade_risk');
+  const main = confirmed.find((l) => l.path.endsWith('subscription.ts')) || confirmed[0];
+  const rejected = rem ? rem.attempts.filter((a) => a.verdict === 'rejected') : [];
+  const accepted = rem ? rem.attempts.find((a) => a.verdict === 'accepted') : null;
+  const after = rem?.after;
+  return `<section class="feature">
+    <div class="f-head">
+      <div class="f-title">
+        <span class="prov stripe">S</span>
+        <div><div class="eyebrow">Breaking API change · Stripe <code>2025-03-31.basil</code></div>
+          <h2>Subscription billing periods moved to subscription items</h2></div>
+      </div>
+      <span class="pill red">Confirmed</span>
+    </div>
+    <div class="steps">
+      <div class="st"><div class="sn">${confirmed.length}</div><div class="sl">affected locations</div><div class="ss">exact lines via Semgrep</div></div>
+      <div class="arr">→</div>
+      <div class="st"><div class="sn red">${h.proof.fail}</div><div class="sl">regression failures</div><div class="ss">on unpatched code · ${h.proof.pass} other tests pass</div></div>
+      <div class="arr">→</div>
+      <div class="st"><div class="sn green">${after ? `${after.pass}/${after.pass + after.fail}` : '—'}</div><div class="sl">tests passing</div><div class="ss">with the verified fix</div></div>
+    </div>
+    ${rem ? `<div class="ba">
+      ${rejected.map((a) => `<div class="ba-x"><span class="tag red">Rejected</span><code class="strike">${esc(a.candidate)}</code><span class="muted">${esc(rejectSummary(a.reason))}</span></div>`).join('')}
+      ${accepted ? `<div class="ba-ok"><span class="tag green">Accepted</span><code>${esc(accepted.candidate)}</code><span class="muted">all tests pass · Semgrep re-scan clean</span></div>` : ''}
+    </div>` : ''}
+    ${risk.length ? `<div class="risk-note"><span class="dot amber"></span>${risk.map((l) => `<code>${esc(shortPath(l.path))}:${l.line}</code>`).join(', ')} is pinned to the older <code>acacia</code> API: <b>upgrade risk</b>, not broken today.</div>` : ''}
+    <div class="actions">
+      ${main ? `<a class="btn" href="#/finding/${esc(run.run_id)}/${esc(main.finding_id)}">View code</a>` : ''}
+      ${h.issue ? `<a class="btn ghost" href="${esc(h.issue.url)}" target="_blank">View Issue #${h.issue.number} ↗</a>` : ''}
+      ${rem ? `<a class="btn ghost" href="${esc(rem.pr.url)}" target="_blank">View PR #${rem.pr.number} ↗</a>` : ''}
+      <a class="link-muted" href="${esc(h.source_url)}" target="_blank">Official Stripe changelog ↗</a>
+    </div>
+    <details class="more"><summary>Technical details</summary>
+      <div class="more-grid">
+        <div><div class="k">Affected lines</div>${h.locations.map((l) => `<div><a class="mono" href="#/finding/${esc(run.run_id)}/${esc(l.finding_id)}">${esc(l.path)}:${l.line}</a> ${l.tier === 'upgrade_risk' ? '<span class="tag amber">upgrade risk</span>' : ''}</div>`).join('')}</div>
+        <div><div class="k">Failing regression tests (before fix)</div>${h.proof.failing.map((t) => `<div class="small">${esc(t)}</div>`).join('')}</div>
+        <div><div class="k">Provenance</div>
+          <div class="small">Scanned <code>${esc(short(run.commit_sha))}</code> · rule <code>driftguard.stripe.subscription-period-fields-removed-basil</code></div>
+          ${rem ? `<div class="small">PR #${rem.pr.number} by ${esc(rem.pr.executor === 'guild' ? 'Guild remediator agent' : 'direct GitHub fallback')} · from ${esc(rem.source)}</div>` : ''}</div>
+      </div>
+    </details>
+  </section>`;
+}
+
+function findingsTable(run, sec) {
+  const rank = (g) => (g.locations.some((l) => l.tier === 'confirmed') ? 0 : 1);
+  const rows = [...sec].sort((a, b) => rank(a) - rank(b)).map((g) => {
+    const loc = g.locations.filter((l) => l.status !== 'exposed');
+    const first = loc[0] || g.locations[0];
+    const tierName = first?.tier;
+    const rem = g.remediation;
+    const action = rem ? `<a href="${esc(rem.pr.url)}" target="_blank" onclick="event.stopPropagation()">PR #${rem.pr.number} ↗</a>${g.issue ? ` · <a href="${esc(g.issue.url)}" target="_blank" onclick="event.stopPropagation()">Issue #${g.issue.number} ↗</a>` : ''}`
+      : '<span class="muted">Review · no auto-fix</span>';
+    return `<tr class="click" onclick="location.hash='#/finding/${esc(run.run_id)}/${esc(first.finding_id)}'">
+      <td><div class="fw">${esc(g.cve || g.change_id)}</div><div class="muted small">${esc((g.title || '').slice(0, 60))}</div></td>
+      <td><div>${esc(langOf(first.path))}</div><div class="muted small mono">${esc(g.package?.split(':').pop())} ${esc(g.installed)}</div></td>
+      <td>${tierName === 'confirmed' ? '<span class="pill red">Confirmed</span>' : tierName === 'candidate' ? '<span class="pill amber">Candidate</span>' : tier(tierName)}</td>
+      <td class="mono small">${loc.map((l) => `${esc(shortPath(l.path))}:${l.line}`).join('<br>')}</td>
+      <td class="small">${action}</td></tr>`;
+  }).join('');
+  return `<section class="panel">
+    <div class="p-head"><h3>Dependency vulnerabilities</h3><span class="muted small">Exact lines · version-checked against OSV · click a row for evidence</span></div>
+    <table class="clean"><tr><th>Finding</th><th>Language / package</th><th>Confidence</th><th>Location</th><th>Action</th></tr>${rows}</table>
+  </section>`;
+}
+
+function evidencePanel(o, run) {
+  const g = o.evidence.guild, a = o.evidence.akash, c = o.evidence.clickhouse, s = o.evidence.semgrep;
+  const guildRunning = ['RUNNING', 'STARTING'].includes(g.status);
+  const okDot = (ok, running) => `<span class="dot ${running ? 'amber pulse' : ok ? 'green' : 'red'}"></span>`;
+  const chips = [
+    ['Guild', g.status === 'DONE', guildRunning, guildRunning ? 'agent running' : `${g.tool_calls.length} tool calls`],
+    ['ClickHouse', !!c.vector_stats, false, c.vector_stats ? `${Math.round(c.vector_stats.elapsed_ms)} ms vector query` : ''],
+    ['Akash', a.health?.deployment === 'akash', false, a.median_server_ms != null ? `${Math.round(a.median_server_ms)} ms inference` : ''],
+    ['Semgrep', true, false, `${s.results} matches`],
+    ['GitHub', true, false, '<span id="ciMini">CI…</span>'],
+  ];
+  return `<details class="panel evidence" id="evidence">
+    <summary><h3>How DriftGuard investigated</h3>
+      <div class="chips">${chips.map(([n, ok, run2, t]) => `<span class="ichip">${okDot(ok, run2)}${n}<span class="muted">${t}</span></span>`).join('')}</div>
+      <span class="muted small">details ▾</span></summary>
+    <div class="ev-grid">
+      <div><div class="k">Guild.ai: watcher agent</div>
+        ${g.session_url ? `<div><a href="${esc(g.session_url)}" target="_blank">Open session trace ↗</a></div>` : '<div class="muted">No watcher session in this run</div>'}
+        ${guildRunning ? '<div class="muted small">Agent is fetching Stripe + OSV and reading lockfiles via Guild GitHub; evidence attaches when it finishes.</div>'
+          : `<div class="small">Pinned <code>${esc(short(g.commit_sha))}</code> ${g.sha_agrees ? '<span class="pass">= platform</span>' : ''} · Stripe sha256 ${g.stripe_hash_agrees ? '<span class="pass">matches</span>' : 'n/a'} · ${esc(g.elapsed_s)}s</div>
+             <ul class="calls">${g.tool_calls.map((t) => `<li>${esc(typeof t === 'string' ? t.replace(/ \((\d+|None) ms\)$/, '') : t.call)}</li>`).join('')}</ul>`}
+        ${o.headline?.remediation?.pr?.executor === 'guild' ? `<div class="small">PR #${o.headline.remediation.pr.number} opened by the Guild remediator agent</div>` : ''}</div>
+      <div><div class="k">Akash: inference service</div>
+        <div class="small">deployment <b>${esc(a.health?.deployment)}</b> · pod <code>${esc((a.health?.host || '').slice(-11))}</code></div>
+        <div class="small">${a.calls} calls · ${esc(a.median_server_ms)} ms server · ${esc(a.median_roundtrip_ms)} ms round trip (median)</div>
+        <div class="small muted mono">${esc(a.health?.embedding_model || '')}</div><div class="small muted mono">${esc(a.health?.model_version || '')}</div></div>
+      <div><div class="k">ClickHouse: vector search + analytics</div>
+        <div class="small">cosineDistance query ${esc(c.vector_stats?.elapsed_ms)} ms · ${esc(c.vector_stats?.rows_read)} rows read · ${c.candidates} candidates</div>
+        <div class="small"><a href="#/timeline/${esc(run.run_id)}">Timeline, SQL &amp; latency analytics →</a></div></div>
+      <div><div class="k">Semgrep: exact lines</div>
+        <div class="small">${esc(s.results)} matches in ${esc(s.elapsed_ms)} ms · v${esc(s.version)} · 5 tested rules</div>
+        <div class="small muted">Type-aware rules ignore look-alike fields</div></div>
+      <div><div class="k">GitHub: actions</div>
+        <div class="small">Scanned <a href="https://github.com/${esc(run.repo)}/commit/${esc(run.commit_sha)}" target="_blank"><code>${esc(short(run.commit_sha))}</code></a> · draft PRs only, human merges</div>
+        <div class="small" id="ciFull">CI status loading…</div></div>
+    </div>
+    ${(o.quarantine || []).length ? `<div class="q-note"><span class="dot amber"></span>Prompt-injection text in <code>${esc(o.quarantine[0].source)}</code> was quarantined: stored as evidence, never obeyed.</div>` : ''}
+  </details>`;
+}
 
 async function benchmarkCard(runId) {
   const box = document.getElementById('bench');
   try {
     const b = await api(`/api/benchmark?run_id=${encodeURIComponent(runId)}`);
-    const pct = (m) => `${m.detected ?? Math.round(m.value * m.n)}/${m.n}`;
-    box.innerHTML = `<div class="row" style="justify-content:space-between;flex-wrap:wrap"><h2 style="margin:0">Benchmark, scored live against this run</h2>
-      <span class="small muted">demo repo <code>benchmark/run_benchmark.py</code> · small hand-built corpus</span></div>
-      <div class="grid g4" style="margin:10px 0">
-        <div><div class="muted small">Impacted scenarios detected</div><div class="score pass">${pct(b.case_recall)}</div></div>
-        <div><div class="muted small">Exact line localization</div><div class="score pass">${Math.round(b.exact_line_localization.value * b.exact_line_localization.n)}/${b.exact_line_localization.n}</div></div>
-        <div><div class="muted small">False alerts on known-safe cases</div><div class="score pass">${b.false_positive_rate.incorrect}/${b.false_positive_rate.n}</div></div>
-        <div><div class="muted small">Pinned / dev / unverified not called broken</div><div class="score pass">${Math.round(b.version_correctness.value * b.version_correctness.n)}/${b.version_correctness.n}</div></div>
-      </div>
-      <div class="grid g2">
-        <table><tr><th>Scenario</th><th>Lines found</th><th>Tier</th><th></th></tr>${b.scenarios.map((s) => `<tr><td class="small"><b>${esc(s.scenario)}</b> ${esc((b.scenario_titles || {})[s.scenario.split('/')[0]] || '').slice(0, 64)}</td>
+    const n = (m) => Math.round(m.value * m.n);
+    box.innerHTML = `<summary><h3>Benchmark</h3>
+        <div class="chips"><span class="ichip"><span class="dot green"></span>${b.case_recall.detected}/${b.case_recall.n}<span class="muted">detected, exact lines</span></span>
+        <span class="ichip"><span class="dot green"></span>${b.false_positive_rate.incorrect}/${b.false_positive_rate.n}<span class="muted">false alerts on safe cases</span></span>
+        <span class="ichip"><span class="dot green"></span>4<span class="muted">languages</span></span></div>
+        <span class="muted small">small self-built corpus · details ▾</span></summary>
+      <div class="ev-grid two">
+        <table class="clean"><tr><th>Scenario</th><th>Lines</th><th>Tier</th><th></th></tr>${b.scenarios.map((s) => `<tr><td class="small"><b>${esc(s.scenario)}</b> ${esc(((b.scenario_titles || {})[s.scenario.split('/')[0]] || '').slice(0, 52))}</td>
           <td class="mono small">${esc(s.found_lines.join(', '))}</td><td>${s.tiers.map(tier).join(' ')}</td><td>${s.detected && s.exact_lines ? '<span class="pass">✓</span>' : '<span class="fail">✗</span>'}</td></tr>`).join('')}</table>
-        <table><tr><th>Negative / edge case</th><th>Observed</th><th></th></tr>${b.negatives.map((n) => `<tr><td class="small">${esc((b.edge_case_titles || {})[String(n.edge)] || EXTRA_NEG[n.edge] || n.edge)}</td>
-          <td class="small mono">${esc(n.observed.join(', ') || 'no alert')}</td><td>${n.correct_non_alert ? '<span class="pass">✓</span>' : '<span class="fail">✗</span>'}</td></tr>`).join('')}</table>
-      </div>`;
-  } catch (e) { box.innerHTML = `<div class="muted">Benchmark unavailable: ${esc(e.message)}</div>`; }
+        <table class="clean"><tr><th>Negative / edge case</th><th>Observed</th><th></th></tr>${b.negatives.map((x) => `<tr><td class="small">${esc((b.edge_case_titles || {})[String(x.edge)] || EXTRA_NEG[x.edge] || x.edge)}</td>
+          <td class="small mono">${esc(x.observed.join(', ') || 'no alert')}</td><td>${x.correct_non_alert ? '<span class="pass">✓</span>' : '<span class="fail">✗</span>'}</td></tr>`).join('')}</table>
+      </div>
+      <div class="muted small" style="padding:0 18px 14px">Version correctness: ${n(b.version_correctness)}/${b.version_correctness.n} pinned/dev/unverified cases not called broken.</div>`;
+  } catch (e) { box.innerHTML = `<summary><h3>Benchmark</h3><span class="muted small">unavailable: ${esc(e.message)}</span></summary>`; }
 }
 
 async function pageOverview(params) {
@@ -171,57 +225,74 @@ async function pageOverview(params) {
   const o = await api(`/api/overview${params.get('run') ? '?run_id=' + encodeURIComponent(params.get('run')) : ''}`);
   FALLBACK = o.fallback_run_id;
   const run = o.run;
+  const inv = await api(`/api/investigations/${encodeURIComponent(run.run_id)}`);
   $app.innerHTML = `
-  <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:10px">
-    <div><h1 style="margin:0">When the outside world changes, see exactly what breaks.</h1>
-      <div class="sub" style="margin:6px 0 0">${runBadge(run)} &nbsp;<a href="https://github.com/${esc(run.repo)}" target="_blank">${esc(run.repo)}</a> @ <code>${esc(short(run.commit_sha))}</code>
-        · ${Math.round((run.duration_ms || 0) / 1000)}s · run <a href="#/timeline/${esc(run.run_id)}"><code>${esc(run.run_id)}</code></a>
-        ${o.fallback_run_id && o.fallback_run_id !== run.run_id ? ` · <a href="#/overview?run=${esc(o.fallback_run_id)}">open recorded fallback run</a>` : ''}</div></div>
-    <button class="btn" id="liveRun">▶ Run live investigation</button>
-  </div>
-  <div id="liveBox"></div>
-  <div style="margin-top:14px">${evidenceCards(o.evidence, run, o.headline)}</div>
-  ${headlineCard(run, o.headline)}
-  ${securityCards(run, o.security)}
-  <div class="card" id="bench" style="margin-top:14px"><span class="spin"></span> scoring benchmark…</div>
-  ${(o.quarantine || []).length ? `<div class="notice" style="margin-top:14px"><b>Prompt-injection text quarantined</b> in ${esc(o.quarantine[0].source)}: “${esc(o.quarantine[0].spans[0].slice(0, 110))}…” Stored as evidence only; no agent or tool acted on it.</div>` : ''}`;
+  <section class="hero2">
+    <div class="h-left">
+      <h1>Know exactly what breaks before it reaches production.</h1>
+      <div class="h-meta">
+        <a href="https://github.com/${esc(run.repo)}" target="_blank">${esc(run.repo)}</a>
+        <span class="sep">·</span><code>${esc(short(run.commit_sha))}</code>
+        <span class="sep">·</span>${runBadge(run)}
+        <span class="sep">·</span><span class="muted">${Math.round((run.duration_ms || 0) / 1000)}s run</span>
+        ${o.fallback_run_id && o.fallback_run_id !== run.run_id ? `<span class="sep">·</span><a class="link-muted" href="#/overview?run=${esc(o.fallback_run_id)}">recorded fallback</a>` : ''}
+      </div>
+    </div>
+    <button class="btn big" id="liveRun">▶ Run live investigation</button>
+  </section>
+  <div id="liveBox" class="livebox"></div>
+  ${heroMetrics(inv, o)}
+  ${featured(run, o.headline)}
+  ${findingsTable(run, o.security)}
+  ${evidencePanel(o, run)}
+  <details class="panel evidence" id="bench"><summary><h3>Benchmark</h3><span class="muted small"><span class="spin"></span> scoring…</span></summary></details>`;
   document.getElementById('liveRun').onclick = startLiveFromOverview;
   benchmarkCard(run.run_id);
+  const pr = o.headline?.remediation?.pr;
+  if (pr) {
+    api(`/api/pr-status?url=${encodeURIComponent(pr.url)}`).then((st) => {
+      const ok = st.checks.filter((c) => c.conclusion === 'success').length;
+      const txt = `PR #${pr.number} CI ${ok}/${st.checks.length}`;
+      document.getElementById('ciMini').textContent = txt;
+      document.getElementById('ciFull').innerHTML = `<a href="${esc(pr.url)}/checks" target="_blank">${esc(txt)} checks passing ↗</a> · ${st.draft ? 'draft' : ''} · ${st.merged ? 'merged' : 'not merged'}`;
+    }).catch(() => { document.getElementById('ciMini').textContent = 'CI n/a'; });
+  }
   if (['RUNNING', 'STARTING'].includes(o.evidence.guild.status)) {
     POLL = setInterval(async () => {
       const fresh = await api(`/api/overview?run_id=${encodeURIComponent(run.run_id)}`);
       if (!['RUNNING', 'STARTING'].includes(fresh.evidence.guild.status)) { clearInterval(POLL); route(); }
     }, 4000);
   }
-  const pr = o.headline?.remediation?.pr;
-  if (pr) {
-    api(`/api/pr-status?url=${encodeURIComponent(pr.url)}`).then((st) => {
-      const ok = st.checks.filter((c) => c.conclusion === 'success').length;
-      document.getElementById('ciBox').innerHTML = `PR #${pr.number} CI: <span class="${ok === st.checks.length ? 'pass' : 'fail'}">${ok}/${st.checks.length} checks pass</span> · ${st.draft ? 'draft' : ''} ${st.merged ? 'merged' : 'unmerged'}`;
-    }).catch(() => { document.getElementById('ciBox').textContent = 'CI status unavailable'; });
-  }
 }
 
 async function startLiveFromOverview() {
   const btn = document.getElementById('liveRun');
   btn.disabled = true;
-  btn.innerHTML = '<span class="spin"></span> Live investigation running…';
+  btn.innerHTML = '<span class="spin"></span> Investigating…';
   const { run_id } = await post('/api/investigations', {});
   RUN = run_id;
   const box = document.getElementById('liveBox');
+  box.classList.add('on');
   const t0 = Date.now();
   clearInterval(POLL);
   POLL = setInterval(async () => {
     const ev = await api(`/api/investigations/${run_id}/events`);
     const secs = Math.round((Date.now() - t0) / 1000);
-    box.innerHTML = `<div class="card" style="margin-top:12px"><div class="row" style="justify-content:space-between"><b>Live run <code>${esc(run_id)}</code></b><span class="muted small">${secs}s elapsed · ${ev.events.length} measured events</span></div>
-      <div class="timeline">${ev.events.slice(-8).map(evRow).join('')}</div></div>`;
+    const last = ev.events[ev.events.length - 1];
+    const pct = Math.min(96, Math.round((ev.events.length / EXPECTED_STAGES) * 100));
+    const done = new Set(ev.events.map((e) => e.stage));
+    box.innerHTML = `<div class="lb-row"><span class="spin"></span><b>${esc(last ? (STAGE_LABEL[last.stage] || last.stage) : 'Starting')}</b>
+        <span class="muted">${last ? esc(last.provider) + ' · ' + last.duration_ms + ' ms' : ''}</span><span class="grow"></span>
+        <span class="muted mono">${secs}s · ${ev.events.length} measured events · <code>${esc(run_id)}</code></span></div>
+      <div class="lb-bar"><div style="width:${pct}%"></div></div>
+      <div class="lb-stages">${['repo_snapshot', 'source_fetch', 'guild_watcher', 'code_index', 'vector_retrieval', 'semgrep', 'regression_proof', 'ml_rank'].map((s) =>
+        `<span class="${done.has(s) ? 'done' : ''}">${esc(STAGE_LABEL[s])}</span>`).join('')}</div>`;
     if (ev.status !== 'running') {
       clearInterval(POLL);
       if (ev.status === 'complete') location.hash = `#/overview?run=${run_id}`;
       else box.innerHTML += `<div class="notice bad">Live run failed: ${esc(ev.error)}. ${FALLBACK ? `<a href="#/overview?run=${esc(FALLBACK)}">Open the recorded fallback run</a>` : ''}</div>`;
     }
-  }, 1500);
+  }, 1200);
 }
 
 // ------------------------------------------------------------------------------------------- Page A
