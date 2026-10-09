@@ -40,6 +40,101 @@ def context(state, group, findings, rem, proof, issue=None, ci=None, latest=None
     }
 
 
+LANG = {"ts": "typescript", "js": "javascript", "py": "python", "java": "java", "json": "json", "txt": "text", "xml": "xml"}
+
+
+def _diff_files(diff):
+    files, cur, hunk = {}, None, None
+    for line in (diff or "").splitlines():
+        if line.startswith("diff --git"):
+            cur = files.setdefault(line.split(" b/")[-1], [])
+            hunk = None
+            continue
+        if cur is None or line.startswith(("+++", "---", "index ", "new file", "deleted file")):
+            continue
+        if line.startswith("@@"):
+            hunk = [line]
+            cur.append(hunk)
+        elif hunk is not None:
+            hunk.append(line)
+    return files
+
+
+def _fix_hunk(diff, f):
+    needle = ((f.get("semgrep") or {}).get("matched_code") or "").splitlines()
+    needle = needle[0].strip() if needle else ""
+    for h in _diff_files(diff).get(f["path"], []):
+        if needle and any(l.startswith("-") and l[1:].strip() == needle for l in h):
+            return "\n".join(h)
+    return None
+
+
+def _snippet(f, pad=3):
+    code = f.get("code") or {}
+    lines, first = code.get("lines") or [], code.get("first_line", 1)
+    if not lines:
+        return None, None, None
+    a = max(f["line"] - pad, first)
+    b = min(f.get("end_line", f["line"]) + pad, first + len(lines) - 1)
+    return a, b, "\n".join(lines[a - first : b - first + 1])
+
+
+def _why(c, f):
+    sg = f.get("semgrep") or {}
+    gate = f.get("version_gate") or {}
+    msg = (sg.get("message") or "").strip().split(". ")[0].rstrip(".")
+    if gate.get("api_version"):
+        ctx = f"This code path receives Stripe API `{gate['api_version']}` ({gate.get('basis', '')})."
+    elif gate.get("installed"):
+        ctx = f"Installed `{gate['installed']}` is in the affected range: {gate.get('rule', '')}."
+    else:
+        ctx = ""
+    return f"{msg}. {ctx}".strip()
+
+
+def exact_code_section(c):
+    """Per-location evidence: permalink, real snippet from the scanned commit, rule, why, and the tested correction."""
+    repo, sha = c["repo"], c["scan_sha"]
+    diff = (c["rem"] or {}).get("diff")
+    out = ["## 🔍 Exact Affected Code & Locations", "",
+           f"Scanned commit [`{sha[:7]}`](https://github.com/{repo}/commit/{sha}). Lines and snippets come from that commit and the Semgrep findings.", ""]
+    manifest_shown = False
+    for i, f in enumerate(c["impacted"], 1):
+        sg = f.get("semgrep") or {}
+        a, b, snip = _snippet(f)
+        ext = f["path"].rsplit(".", 1)[-1]
+        link = f"https://github.com/{repo}/blob/{sha}/{f['path']}#L{f['line']}" + (f"-L{f['end_line']}" if f.get("end_line", f["line"]) != f["line"] else "")
+        out += [f"### {i}. [`{f['path']}:{f['line']}`]({link})", "",
+                f"**Rule:** `{sg.get('rule_id', 'n/a')}` · **Affected expression (line {f['line']}):** `{(sg.get('matched_code') or '').strip()[:140]}`", "",
+                f"**Why:** {_why(c, f)}", ""]
+        if snip:
+            out += [f"Lines {a}–{b} at `{sha[:7]}`:", f"```{LANG.get(ext, '')}", snip, "```", ""]
+        hunk = _fix_hunk(diff, f) if diff else None
+        if hunk:
+            out += ["**Proposed correction** (tested patch):", "```diff", hunk, "```", ""]
+        elif diff and not manifest_shown:
+            manifests = {p: h for p, h in _diff_files(diff).items() if p.endswith(("package.json", "requirements.txt", "pom.xml"))}
+            if manifests:
+                manifest_shown = True
+                out += ["**Proposed correction** (tested patch): this call site stays as is, and the dependency is upgraded out of the affected range:"]
+                for p, hs in manifests.items():
+                    out += [f"`{p}`", "```diff", "\n".join(hs[0]), "```"]
+                out.append("")
+        elif not diff:
+            fixed = c["group"].get("version_check", {}).get("fixed_versions") or []
+            if fixed:
+                out += [f"**Recommended correction:** upgrade past the affected range (OSV fix versions: {', '.join(f'`{v}`' for v in fixed)}).", ""]
+    for f in c["others"]:
+        if f["confidence_tier"] == "upgrade_risk":
+            a, b, snip = _snippet(f, pad=1)
+            link = f"https://github.com/{repo}/blob/{sha}/{f['path']}#L{f['line']}"
+            out += [f"### ⚠️ Upgrade risk, not currently broken: [`{f['path']}:{f['line']}`]({link})", "",
+                    f"{(f.get('limitations') or [''])[0]}", ""]
+            if snip:
+                out += [f"```{LANG.get(f['path'].rsplit('.', 1)[-1], '')}", snip, "```", ""]
+    return out
+
+
 def summary_lines(c):
     ch = c["change"]
     before_pass, before_fail = _cases((c["proof"] or {}).get("run"))
@@ -214,41 +309,42 @@ def details(summary, body_lines):
     return ["<details>", f"<summary>{summary}</summary>", "", *body_lines, "", "</details>"]
 
 
-def pr_body(c, executor_note, refreshed_note=None):
-    out = [f"> {executor_note} Human review required; DriftGuard never merges.", "", "### Summary", *summary_lines(c), "",
-           "### Affected code", *affected_table(c), "", "### Evidence", *evidence_block(c), "",
-           "### Verification", *verification_block(c), ""]
-    rem = c["rem"] or {}
-    if rem.get("diff"):
-        diff = rem["diff"][rem["diff"].find("diff --git"):] if "diff --git" in rem["diff"] else rem["diff"]
-        out += details("Patch diff", ["```diff", diff[:12000], "```"]) + [""]
+def _fix_and_tests(c):
+    out = ["## ✅ Verified Fix & Tests", ""]
+    if c["accepted"]:
+        out += [f"Accepted approach: **`{c['accepted']['candidate']}`**: {c['accepted'].get('description', '')}", ""]
+    out += verification_block(c) + [""]
     if c["proof"] and (c["proof"].get("run") or {}).get("cases"):
+        after = {x["name"]: x["status"] for x in ((c["accepted"] or {}).get("tests") or {}).get("cases", [])}
         out += details("All regression test results (before → after)", [
             "| Test | Before | After |", "|---|---|---|",
             *[f"| `{t['name']}` | {'✅' if t['status'] == 'pass' else '❌'} | "
-              f"{next(('✅' if x['status'] == 'pass' else '❌' for x in (c['accepted'] or {}).get('tests', {}).get('cases', []) if x['name'] == t['name']), '—')} |"
-              for t in c["proof"]["run"]["cases"]]]) + [""]
-    out += ["### Reviewer checklist", *reviewer_checklist(c), "",
-            *details("Fix → test → deploy checklist", action_checklist(c)), "",
-            *details("🤖 Copy-paste prompt for an AI coding agent (Claude Code / Cursor / Copilot)", ["```text", agent_prompt(c), "```"]), "",
-            "### Traceability", *traceability(c)]
+              f"{('✅' if after[t['name']] == 'pass' else '❌') if t['name'] in after else '—'} |" for t in c["proof"]["run"]["cases"]]]) + [""]
+    return out
+
+
+def _provenance(c):
+    return ["## 📎 Evidence & Provenance", "", *evidence_block(c), "", *traceability(c)]
+
+
+def pr_body(c, executor_note, refreshed_note=None):
+    out = [f"> {executor_note} Human review required; DriftGuard never merges.", "", "## Summary", *summary_lines(c), "",
+           *exact_code_section(c), *_fix_and_tests(c),
+           "## ☑️ Action Checklist", "", "**Reviewer**", *reviewer_checklist(c), "", "**Fix → test → deploy**", *action_checklist(c), "",
+           *details("🤖 Copy-paste prompt for an AI coding agent (Claude Code / Cursor / Copilot)", ["```text", agent_prompt(c), "```"]), "",
+           *_provenance(c)]
     if refreshed_note:
         out += ["", f"<sub>{refreshed_note}</sub>"]
     return "\n".join(out)
 
 
-def issue_body(c, marker, snippets):
-    out = [marker, "", "### Summary", *summary_lines(c), "", "### Affected code", *affected_table(c), ""]
-    if snippets:
-        out += [snippets[0], ""]
-        if len(snippets) > 1:
-            out += details(f"Code at the other {len(snippets) - 1} location(s)", snippets[1:]) + [""]
-    out += ["### Evidence", *evidence_block(c), "", "### Action checklist", *action_checklist(c), "",
-            *details("🤖 Copy-paste prompt for an AI coding agent (Claude Code / Cursor / Copilot)", ["```text", agent_prompt(c), "```"]), ""]
+def issue_body(c, marker, snippets=None):
+    out = [marker, "", "## Summary", *summary_lines(c), "", *exact_code_section(c)]
     if c["accepted"]:
-        out += ["### Remediation", f"Verified fix in draft PR #{c['pr']['number']} (accepted `{c['accepted']['candidate']}`)."]
-        out += [*verification_block(c), ""]
-    out += ["### Traceability", *traceability(c), "", "---",
+        out += [*_fix_and_tests(c), f"Verified fix: draft PR #{c['pr']['number']}.", ""]
+    out += ["## ☑️ Action Checklist", "", *action_checklist(c), "",
+            *details("🤖 Copy-paste prompt for an AI coding agent (Claude Code / Cursor / Copilot)", ["```text", agent_prompt(c), "```"]), "",
+            *_provenance(c), "", "---",
             f"<sub>Filed by DriftGuard via the GitHub API (operator token) · updated {datetime.now(timezone.utc).strftime('%Y-%m-%d')} · "
             "only Semgrep-matched lines with a reproduced regression are filed; re-scans update this issue instead of opening a new one.</sub>"]
     return "\n".join(out)
