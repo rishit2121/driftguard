@@ -262,7 +262,7 @@ function keyOutput(L, id) {
     case 'github': return evs(L, 'repo_snapshot')[0] ? `<code>${esc(short(evs(L, 'repo_snapshot')[0].details.commit_sha))}</code> pinned · ${inv.packages ?? '…'} packages · ${(inv.languages || []).length || '…'} languages` : 'resolving branch → commit SHA…';
     case 'guild': {
       const g = L.guild;
-      if (g.status === 'DONE') return `${g.tool_calls.length} tool calls · ${g.sources.map((s) => new URL(s.url).hostname).join(' + ')} · <a href="${esc(g.session_url)}" target="_blank" onclick="event.stopPropagation()">session ↗</a>`;
+      if (g.status === 'DONE') return `${g.tool_calls.length ? `${g.tool_calls.length} tool calls` : 'tool-call list in session trace'} · ${g.sources.map((s) => new URL(s.url).hostname).join(' + ')} · <a href="${esc(g.session_url)}" target="_blank" onclick="event.stopPropagation()">session ↗</a>`;
       if (g.session_url) return `agent running in Guild (non-blocking) · <a href="${esc(g.session_url)}" target="_blank" onclick="event.stopPropagation()">watch session ↗</a>`;
       return g.status === 'ERROR' ? esc(g.error || 'session failed') : 'starting Guild session…';
     }
@@ -358,7 +358,7 @@ function stagePanel(L, id) {
         ${g.status !== 'DONE' ? '' : `<div>Pinned by agent</div><div>${g.commit_sha ? `<code>${esc(short(g.commit_sha))}</code> ${g.commit_sha === L.run.commit_sha ? '<span class="pass">matches platform snapshot</span>' : ''}` : '—'} · ${esc(g.package_count ?? '—')} packages from ${(g.manifests || []).length} manifests</div>
         <div>Sources fetched by Guild</div><div>${g.sources.map((s) => `<div><code>${esc(s.status)}</code> ${esc(s.url)} · ${esc(s.bytes)} bytes · sha256 <code>${esc((s.sha256 || '').slice(0, 12))}</code></div>`).join('') || '—'}</div>
         <div>Independent cross-check</div><div>${own ? `Platform fetched the same changelog: sha256 <code>${esc((own.sha256 || '').slice(0, 12))}</code> ${L.stripe?.change?.guild_hash_agrees ? '<span class="pass">identical</span>' : ''}` : '—'}</div>
-        <div>Tool calls</div><div><ol class="calls">${g.tool_calls.map((c) => `<li>${esc(c.call)}${c.ms != null ? ` <span class="muted">${c.ms} ms</span>` : ''}</li>`).join('')}</ol></div></div>`}`;
+        <div>Tool calls</div><div>${g.tool_calls.length ? `<ol class="calls">${g.tool_calls.map((c) => `<li>${esc(c.call)}${c.ms != null ? ` <span class="muted">${c.ms} ms</span>` : ''}</li>`).join('')}</ol>` : `<span class="muted">Guild's events API was slow for this session; open the <a href="${esc(g.session_url)}" target="_blank">session trace ↗</a> for the call list.</span>`}</div></div>`}`;
     }
     case 'akash': {
       const h = evs(L, 'ml_health')[0]?.details || {};
