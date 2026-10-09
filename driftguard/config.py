@@ -41,6 +41,12 @@ DEMO_BRANCH = os.environ.get("DRIFTGUARD_BRANCH", "main")
 PR_EXECUTOR = os.environ.get("DRIFTGUARD_PR_EXECUTOR", "github")
 GUILD_REMEDIATOR_AGENT = os.environ.get("GUILD_REMEDIATOR_AGENT", "")
 GUILD_WATCHER_AGENT = os.environ.get("GUILD_WATCHER_AGENT", "")
+# Upper bound on waiting for a Guild session (keeps a live demo from stalling; the platform's own watcher still runs).
+GUILD_TIMEOUT_S = int(os.environ.get("GUILD_TIMEOUT_S", "120"))
+# A previously completed genuine run shown as a clearly labeled fallback if a live run fails on stage.
+FALLBACK_RUN_ID = os.environ.get("DRIFTGUARD_FALLBACK_RUN", "")
+# File/update GitHub Issues and inline PR review comments for confirmed findings after each run.
+GITHUB_REPORTS = os.environ.get("DRIFTGUARD_GITHUB_REPORTS", "1") == "1"
 
 SEMGREP_BIN = os.environ.get("SEMGREP_BIN", str(Path.home() / ".local/bin/semgrep"))
 PYTHON_TEST_VERSION = os.environ.get("DRIFTGUARD_PY_TEST_VERSION", "3.10")

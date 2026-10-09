@@ -15,6 +15,15 @@ const tier = (t) => `<span class="tier ${esc(t || 'none')}">${esc(tierLabel[t] |
 const prov = (p) => `<span class="prov ${esc(p)}">${esc({ stripe: 'S', osv: 'OSV', shopify: 'Sh', semgrep: 'SG' }[p] || '?')}</span>`;
 const fmtTime = (t) => (t ? new Date(t).toLocaleString() : '—');
 let RUN = null; // latest run id
+let FALLBACK = null;
+function runBadge(run) {
+  if (!run || !run.finished_at) return '';
+  const ageMin = (Date.now() - new Date(run.finished_at).getTime()) / 60000;
+  if (FALLBACK && run.run_id === FALLBACK) return `<span class="badge-rec" title="A previously completed genuine run, preserved as a fallback">RECORDED FALLBACK RUN · finished ${esc(fmtTime(run.finished_at))}</span>`;
+  return ageMin < 10 ? `<span class="badge-live">LIVE RUN · finished ${Math.max(0, Math.round(ageMin))} min ago</span>`
+    : `<span class="badge-rec">RECORDED RUN · finished ${esc(fmtTime(run.finished_at))}</span>`;
+}
+const langOf = (p) => ({ ts: 'TypeScript', js: 'JavaScript', py: 'Python', java: 'Java' }[(p || '').split('.').pop()] || '');
 let POLL = null;
 
 function setNav(name) {
@@ -39,6 +48,180 @@ async function services() {
 async function latestRun() {
   if (!RUN) RUN = (await api('/api/investigations/latest')).run_id;
   return RUN;
+}
+
+
+// ------------------------------------------------------------------------------------------- Overview (demo landing)
+function evidenceCards(ev, run, headline) {
+  const g = ev.guild, a = ev.akash, c = ev.clickhouse, s = ev.semgrep;
+  const pr = headline?.remediation?.pr;
+  return `<div class="grid g5">
+    <div class="ev-card"><h4>Guild.ai ${g.status === 'DONE' ? '<span class="pass">✓</span>' : ['RUNNING', 'STARTING'].includes(g.status) ? '<span class="spin"></span>' : '<span class="fail">—</span>'}</h4>
+      ${['RUNNING', 'STARTING'].includes(g.status) ? `<div>Watcher session ${g.session_url ? `<a href="${esc(g.session_url)}" target="_blank">running ↗</a>` : 'starting…'}</div>
+        <div class="muted">Guild agent is fetching Stripe + OSV and reading lockfiles via Guild's GitHub integration; evidence attaches when it finishes.</div>`
+      : g.session_url ? `<div>Watcher session <a href="${esc(g.session_url)}" target="_blank">trace ↗</a></div>
+      <div class="muted">${g.tool_calls.length} tool calls · ${esc(g.elapsed_s)}s · pinned <code>${esc(short(g.commit_sha))}</code> ${g.sha_agrees ? '<span class="pass">= platform</span>' : ''}</div>
+      <div class="muted">Stripe sha256 ${g.stripe_hash_agrees ? '<span class="pass">matches</span>' : 'n/a'}</div>` : '<div class="muted">no watcher session in this run</div>'}
+      ${pr && pr.executor === 'guild' ? `<div style="margin-top:4px">PR <a href="${esc(pr.url)}" target="_blank">#${pr.number}</a> opened by Guild remediator</div>` : ''}</div>
+    <div class="ev-card"><h4>Akash ${a.health?.deployment === 'akash' ? '<span class="pass">✓</span>' : `<span class="fail">${esc(a.health?.deployment || 'down')}</span>`}</h4>
+      <div>deployment: <b>${esc(a.health?.deployment)}</b> · pod <code>${esc((a.health?.host || '').slice(-11))}</code></div>
+      <div class="muted">${a.calls} inference calls · server ${esc(a.median_server_ms)} ms · round trip ${esc(a.median_roundtrip_ms)} ms (median)</div>
+      <div class="muted small" style="overflow-wrap:anywhere">${esc(a.health?.model_version)}</div></div>
+    <div class="ev-card"><h4>ClickHouse <span class="pass">✓</span></h4>
+      <div>cosineDistance query <b>${esc(c.vector_stats?.elapsed_ms)} ms</b></div>
+      <div class="muted">${esc(c.vector_stats?.rows_read)} rows read · ${c.candidates} filtered candidates</div>
+      <div><a href="#/timeline/${esc(run.run_id)}">analytics &amp; timeline →</a></div></div>
+    <div class="ev-card"><h4>Semgrep <span class="pass">✓</span></h4>
+      <div>${esc(s.results)} matches · ${esc(s.elapsed_ms)} ms</div>
+      <div class="muted">v${esc(s.version)} · 5 tested rules (ruleid/ok)</div>
+      <div class="muted">typed rule ignores look-alike fields</div></div>
+    <div class="ev-card"><h4>GitHub <span class="pass">✓</span></h4>
+      <div>scanned <a href="https://github.com/${esc(run.repo)}/commit/${esc(run.commit_sha)}" target="_blank"><code>${esc(short(run.commit_sha))}</code></a></div>
+      <div id="ciBox" class="muted">CI: loading…</div>
+      <div class="muted">draft PRs only · human merges</div></div>
+  </div>`;
+}
+
+function rejectSummary(reason) {
+  const m = (reason || '').match(/^tests failed: (.*)$/s);
+  if (!m) return reason;
+  const failed = m[1].split('; ');
+  return `${failed.length} tests failed, e.g. "${failed[0]}"`;
+}
+
+function headlineCard(run, h) {
+  if (!h) return '';
+  const rem = h.remediation;
+  const confirmed = h.locations.filter((l) => l.tier === 'confirmed');
+  const risk = h.locations.filter((l) => l.tier !== 'confirmed');
+  return `<div class="card" style="margin-top:14px">
+    <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:8px">
+      <div class="row">${prov('stripe')}<div><b style="font-size:16px">${esc(h.title)}</b>
+        <div class="small muted">Stripe API <code>2025-03-31.basil</code> · <a href="${esc(h.source_url)}" target="_blank">official changelog ↗</a></div></div></div>
+      <div>${h.issue ? `<a class="chip" style="color:var(--bad)" href="${esc(h.issue.url)}" target="_blank">issue #${h.issue.number} ↗</a>` : ''} ${tier('confirmed')}</div>
+    </div>
+    <div class="flow" style="margin-top:12px">
+      <div class="step"><div class="lbl">1 · Exact code affected (Semgrep)</div>
+        ${confirmed.map((l) => `<div><a class="mono small" href="#/finding/${esc(run.run_id)}/${esc(l.finding_id)}">${esc(l.path.replace('apps/billing-ts/src/', ''))}:${l.line}</a></div>`).join('')}
+        ${risk.map((l) => `<div class="small"><a class="mono" href="#/finding/${esc(run.run_id)}/${esc(l.finding_id)}">${esc(l.path.replace('apps/billing-ts/src/', ''))}:${l.line}</a> <span class="tier upgrade_risk">upgrade risk</span></div>`).join('')}
+        <div class="small muted" style="margin-top:4px">legacy endpoint pinned to <code>acacia</code>: not called broken</div></div>
+      <div class="arrow">→</div>
+      <div class="step"><div class="lbl">2 · Proof on unpatched code</div>
+        <div class="score"><span class="fail">${h.proof.fail} FAIL</span> <span class="muted" style="font-size:14px">post-basil fixtures</span></div>
+        <div class="score" style="font-size:16px"><span class="pass">${h.proof.pass} PASS</span> <span class="muted" style="font-size:13px">pre-basil + existing tests</span></div>
+        <div class="small muted">recorded pre/post fixtures replayed through production code</div></div>
+      <div class="arrow">→</div>
+      <div class="step"><div class="lbl">3 · Verified fix → draft PR</div>
+        ${rem ? `${rem.attempts.map((a) => `<div class="${a.verdict === 'accepted' ? 'accept' : 'reject'}"><b>${esc(a.verdict.toUpperCase())}</b> <code>${esc(a.candidate)}</code>
+            <div class="muted small">${esc(a.verdict === 'accepted' ? a.reason : rejectSummary(a.reason))}</div></div>`).join('')}
+          ${rem.after ? `<div class="small" style="margin-top:4px">After patch: <span class="pass">${rem.after.pass}/${rem.after.pass + rem.after.fail} PASS</span></div>` : ''}
+          <div style="margin-top:6px"><a href="${esc(rem.pr.url)}" target="_blank"><b>Draft PR #${rem.pr.number} ↗</b></a> <span class="small muted">by ${esc(rem.pr.executor === 'guild' ? 'Guild remediator agent' : 'direct GitHub fallback')}</span></div>
+          <div class="small muted">from ${esc(rem.source)}</div>`
+        : '<div class="muted small">No remediation yet for this change.</div>'}</div>
+    </div></div>`;
+}
+
+function securityCards(run, sec) {
+  return `<div class="grid g3" style="margin-top:14px">${sec.map((g) => {
+    const rem = g.remediation;
+    const rejected = rem ? rem.attempts.filter((a) => a.verdict === 'rejected') : [];
+    const loc = g.locations.filter((l) => l.status !== 'exposed');
+    return `<div class="card"><div class="row" style="justify-content:space-between"><div class="row">${prov('osv')}<div><b>${esc(g.cve || g.change_id)}</b>
+        <div class="small muted"><code>${esc(g.package)} ${esc(g.installed)}</code> · ${esc(langOf(loc[0]?.path))}</div></div></div>${tier(loc[0]?.tier)}</div>
+      <div style="margin-top:8px">${loc.map((l) => `<a class="mono small" href="#/finding/${esc(run.run_id)}/${esc(l.finding_id)}">${esc(l.path.split('/').slice(-2).join('/'))}:${l.line}</a>`).join(' · ')}</div>
+      ${g.proof.status === 'reproduced' ? `<div class="small" style="margin-top:6px">Proof: <span class="fail">${g.proof.fail} FAIL</span> on unpatched code (inert probe)</div>` : `<div class="small muted" style="margin-top:6px">Candidate use site only: exploitability not claimed</div>`}
+      ${rejected.map((a) => `<div class="reject"><b>REJECTED</b> <code>${esc(a.candidate)}</code> <span class="muted small">${esc(a.reason.slice(0, 90))}</span></div>`).join('')}
+      ${rem ? `<div class="accept"><b>ACCEPTED</b> <code>${esc(rem.accepted)}</code>${rem.upgrade_plan?.minimal_fix_remaining ? `<div class="muted small">minimal fix ${esc(rem.upgrade_plan.minimal_fix)} still has ${rem.upgrade_plan.minimal_fix_remaining} advisories, so not chosen</div>` : ''}</div>
+        <div class="small"><a href="${esc(rem.pr.url)}" target="_blank">Draft PR #${rem.pr.number} ↗</a> <span class="muted">(${esc(rem.source)})</span>
+          ${g.issue ? ` · <a href="${esc(g.issue.url)}" target="_blank">issue #${g.issue.number} ↗</a>` : ''}</div>` : ''}
+    </div>`;
+  }).join('')}</div>`;
+}
+
+const EXTRA_NEG = {
+  'E-constant': 'Constant Log4j message (RequestAudit.java:26) must not be flagged',
+  shopify: '40 live Shopify changelog entries, repo has no Shopify usage: no alerts',
+  'stripe-sdk-osv': 'stripe-node 18.0.0 has no OSV advisories: no CVE alert',
+};
+
+async function benchmarkCard(runId) {
+  const box = document.getElementById('bench');
+  try {
+    const b = await api(`/api/benchmark?run_id=${encodeURIComponent(runId)}`);
+    const pct = (m) => `${m.detected ?? Math.round(m.value * m.n)}/${m.n}`;
+    box.innerHTML = `<div class="row" style="justify-content:space-between;flex-wrap:wrap"><h2 style="margin:0">Benchmark, scored live against this run</h2>
+      <span class="small muted">demo repo <code>benchmark/run_benchmark.py</code> · small hand-built corpus</span></div>
+      <div class="grid g4" style="margin:10px 0">
+        <div><div class="muted small">Impacted scenarios detected</div><div class="score pass">${pct(b.case_recall)}</div></div>
+        <div><div class="muted small">Exact line localization</div><div class="score pass">${Math.round(b.exact_line_localization.value * b.exact_line_localization.n)}/${b.exact_line_localization.n}</div></div>
+        <div><div class="muted small">False alerts on known-safe cases</div><div class="score pass">${b.false_positive_rate.incorrect}/${b.false_positive_rate.n}</div></div>
+        <div><div class="muted small">Pinned / dev / unverified not called broken</div><div class="score pass">${Math.round(b.version_correctness.value * b.version_correctness.n)}/${b.version_correctness.n}</div></div>
+      </div>
+      <div class="grid g2">
+        <table><tr><th>Scenario</th><th>Lines found</th><th>Tier</th><th></th></tr>${b.scenarios.map((s) => `<tr><td class="small"><b>${esc(s.scenario)}</b> ${esc((b.scenario_titles || {})[s.scenario.split('/')[0]] || '').slice(0, 64)}</td>
+          <td class="mono small">${esc(s.found_lines.join(', '))}</td><td>${s.tiers.map(tier).join(' ')}</td><td>${s.detected && s.exact_lines ? '<span class="pass">✓</span>' : '<span class="fail">✗</span>'}</td></tr>`).join('')}</table>
+        <table><tr><th>Negative / edge case</th><th>Observed</th><th></th></tr>${b.negatives.map((n) => `<tr><td class="small">${esc((b.edge_case_titles || {})[String(n.edge)] || EXTRA_NEG[n.edge] || n.edge)}</td>
+          <td class="small mono">${esc(n.observed.join(', ') || 'no alert')}</td><td>${n.correct_non_alert ? '<span class="pass">✓</span>' : '<span class="fail">✗</span>'}</td></tr>`).join('')}</table>
+      </div>`;
+  } catch (e) { box.innerHTML = `<div class="muted">Benchmark unavailable: ${esc(e.message)}</div>`; }
+}
+
+async function pageOverview(params) {
+  setNav('overview');
+  const o = await api(`/api/overview${params.get('run') ? '?run_id=' + encodeURIComponent(params.get('run')) : ''}`);
+  FALLBACK = o.fallback_run_id;
+  const run = o.run;
+  $app.innerHTML = `
+  <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:10px">
+    <div><h1 style="margin:0">When the outside world changes, see exactly what breaks.</h1>
+      <div class="sub" style="margin:6px 0 0">${runBadge(run)} &nbsp;<a href="https://github.com/${esc(run.repo)}" target="_blank">${esc(run.repo)}</a> @ <code>${esc(short(run.commit_sha))}</code>
+        · ${Math.round((run.duration_ms || 0) / 1000)}s · run <a href="#/timeline/${esc(run.run_id)}"><code>${esc(run.run_id)}</code></a>
+        ${o.fallback_run_id && o.fallback_run_id !== run.run_id ? ` · <a href="#/overview?run=${esc(o.fallback_run_id)}">open recorded fallback run</a>` : ''}</div></div>
+    <button class="btn" id="liveRun">▶ Run live investigation</button>
+  </div>
+  <div id="liveBox"></div>
+  <div style="margin-top:14px">${evidenceCards(o.evidence, run, o.headline)}</div>
+  ${headlineCard(run, o.headline)}
+  ${securityCards(run, o.security)}
+  <div class="card" id="bench" style="margin-top:14px"><span class="spin"></span> scoring benchmark…</div>
+  ${(o.quarantine || []).length ? `<div class="notice" style="margin-top:14px"><b>Prompt-injection text quarantined</b> in ${esc(o.quarantine[0].source)}: “${esc(o.quarantine[0].spans[0].slice(0, 110))}…” Stored as evidence only; no agent or tool acted on it.</div>` : ''}`;
+  document.getElementById('liveRun').onclick = startLiveFromOverview;
+  benchmarkCard(run.run_id);
+  if (['RUNNING', 'STARTING'].includes(o.evidence.guild.status)) {
+    POLL = setInterval(async () => {
+      const fresh = await api(`/api/overview?run_id=${encodeURIComponent(run.run_id)}`);
+      if (!['RUNNING', 'STARTING'].includes(fresh.evidence.guild.status)) { clearInterval(POLL); route(); }
+    }, 4000);
+  }
+  const pr = o.headline?.remediation?.pr;
+  if (pr) {
+    api(`/api/pr-status?url=${encodeURIComponent(pr.url)}`).then((st) => {
+      const ok = st.checks.filter((c) => c.conclusion === 'success').length;
+      document.getElementById('ciBox').innerHTML = `PR #${pr.number} CI: <span class="${ok === st.checks.length ? 'pass' : 'fail'}">${ok}/${st.checks.length} checks pass</span> · ${st.draft ? 'draft' : ''} ${st.merged ? 'merged' : 'unmerged'}`;
+    }).catch(() => { document.getElementById('ciBox').textContent = 'CI status unavailable'; });
+  }
+}
+
+async function startLiveFromOverview() {
+  const btn = document.getElementById('liveRun');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span> Live investigation running…';
+  const { run_id } = await post('/api/investigations', {});
+  RUN = run_id;
+  const box = document.getElementById('liveBox');
+  const t0 = Date.now();
+  clearInterval(POLL);
+  POLL = setInterval(async () => {
+    const ev = await api(`/api/investigations/${run_id}/events`);
+    const secs = Math.round((Date.now() - t0) / 1000);
+    box.innerHTML = `<div class="card" style="margin-top:12px"><div class="row" style="justify-content:space-between"><b>Live run <code>${esc(run_id)}</code></b><span class="muted small">${secs}s elapsed · ${ev.events.length} measured events</span></div>
+      <div class="timeline">${ev.events.slice(-8).map(evRow).join('')}</div></div>`;
+    if (ev.status !== 'running') {
+      clearInterval(POLL);
+      if (ev.status === 'complete') location.hash = `#/overview?run=${run_id}`;
+      else box.innerHTML += `<div class="notice bad">Live run failed: ${esc(ev.error)}. ${FALLBACK ? `<a href="#/overview?run=${esc(FALLBACK)}">Open the recorded fallback run</a>` : ''}</div>`;
+    }
+  }, 1500);
 }
 
 // ------------------------------------------------------------------------------------------- Page A
@@ -136,7 +319,7 @@ async function pageChanges(params) {
   }).join('');
   $app.innerHTML = `
   <h1>Upstream changes</h1>
-  <p class="sub">Run <a href="#/timeline/${run}"><code>${esc(run)}</code></a> · ${esc(inv.repo)} @ <code>${esc(short(inv.commit_sha))}</code> · ${fmtTime(inv.finished_at)} · ${Math.round((inv.duration_ms || 0) / 1000)}s</p>
+  <p class="sub">${runBadge(inv)} Run <a href="#/timeline/${run}"><code>${esc(run)}</code></a> · ${esc(inv.repo)} @ <code>${esc(short(inv.commit_sha))}</code> · ${fmtTime(inv.finished_at)} · ${Math.round((inv.duration_ms || 0) / 1000)}s</p>
   ${inv.guild_watcher ? `<div class="notice good" style="margin-bottom:12px">Guild watcher session <a href="${esc(inv.guild_watcher.session_url)}" target="_blank">${esc(inv.guild_watcher.session_id)} ↗</a>
     · ${esc(inv.guild_watcher.status)} in ${esc(inv.guild_watcher.elapsed_s)}s · pinned <code>${esc(short((inv.guild_watcher.output || {}).commit_sha))}</code>
     ${(inv.guild_watcher.output || {}).commit_sha === inv.commit_sha ? '(agrees with platform snapshot)' : '<b>(SHA differs from platform snapshot)</b>'}
@@ -155,6 +338,70 @@ async function pageGroup(run, key) {
   const order = ['impacted', 'potentially_affected', 'upgrade_risk', 'needs_review', 'exposed', 'unverified'];
   const f = [...g.findings].sort((a, b) => order.indexOf(a.status) - order.indexOf(b.status))[0];
   location.replace(`#/finding/${run}/${f.finding_id}`);
+}
+
+
+// ------------------------------------------------------------------------------------------- vulnerable vs fixed code
+function parseDiff(diff) {
+  const files = {};
+  let cur = null, hunk = null, o = 0, n = 0;
+  for (const line of (diff || '').split('\n')) {
+    const fm = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
+    if (fm) { cur = files[fm[2]] = []; hunk = null; continue; }
+    const hm = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+    if (hm && cur) { o = +hm[1]; n = +hm[3]; hunk = { oldStart: o, oldCount: +(hm[2] ?? 1), lines: [] }; cur.push(hunk); continue; }
+    if (!hunk || line.startsWith('+++') || line.startsWith('---') || line.startsWith('\\')) continue;
+    if (line.startsWith('-')) hunk.lines.push({ t: 'del', o: o++, text: line.slice(1) });
+    else if (line.startsWith('+')) hunk.lines.push({ t: 'add', n: n++, text: line.slice(1) });
+    else hunk.lines.push({ t: 'ctx', o: o++, n: n++, text: line.slice(1) });
+  }
+  return files;
+}
+
+function hunkFor(files, f) {
+  const hunks = files[f.path] || [];
+  const needle = ((f.semgrep?.matched_code || '').split('\n')[0] || '').trim();
+  return hunks.find((h) => needle && h.lines.some((l) => l.t === 'del' && l.text.trim() === needle))
+    || hunks.find((h) => f.line >= h.oldStart && f.line < h.oldStart + h.oldCount);
+}
+
+function sideLines(h, side) {
+  return `<div class="code">${h.lines.filter((l) => (side === 'old' ? l.t !== 'add' : l.t !== 'del')).map((l) => {
+    const num = side === 'old' ? l.o : l.n;
+    const cls = l.t === 'ctx' ? '' : l.t;
+    return `<div class="ln ${cls}"><span class="n">${num}</span><span class="mk">${l.t === 'del' ? '−' : l.t === 'add' ? '+' : ' '}</span>${esc(l.text) || ' '}</div>`;
+  }).join('')}</div>`;
+}
+
+function vulnVsFix(d, f, g, rem) {
+  const blob = (sha, path, a, b) => `https://github.com/${d.repo}/blob/${sha}/${path}#L${a}${b && b !== a ? '-L' + b : ''}`;
+  const sg = f.semgrep;
+  const sev = g?.change?.severity ? `advisory ${g.change.severity}` : sg?.severity ? `semgrep ${sg.severity}` : '';
+  const why = (sg?.message || f.reasons?.[0] || '').split('. ')[0];
+  const left = `<div class="pane bad"><div class="ph"><b>Vulnerable code</b> · <a href="${blob(d.commit_sha, f.path, f.line, f.end_line)}" target="_blank" class="mono">${esc(f.path)}:${f.line}${f.end_line !== f.line ? '-' + f.end_line : ''} ↗</a>
+      ${sev ? `<span class="sev">${esc(sev)}</span>` : ''} ${sg ? `<div class="mono small muted">${esc(sg.rule_id)}</div>` : ''}<div class="small">${esc(why)}.</div></div>
+    ${codeView(f.code).replace('class="code"', 'class="code" style="border:0;border-radius:0"').replaceAll('ln hl', 'ln del')}</div>`;
+  let right;
+  if (rem && rem.diff) {
+    const files = parseDiff(rem.diff);
+    const h = hunkFor(files, f);
+    const base = rem.base_sha || rem.commit_sha || d.commit_sha;
+    const prLink = `<a href="${esc(rem.pr.url)}" target="_blank">PR #${rem.pr.number} ↗</a>`;
+    if (h) {
+      right = `<div class="pane good"><div class="ph"><b>Proposed fix</b> · accepted candidate <code>${esc(rem.accepted)}</code> · ${prLink}
+          <div class="small">Tested: every existing and regression test passes on the patched code.</div></div>
+        ${sideLines(h, 'new').replace('class="code"', 'class="code" style="border:0;border-radius:0"')}</div>`;
+    } else {
+      const manifest = Object.keys(files).filter((p) => /package\.json$|requirements[^/]*\.txt$|pom\.xml$/.test(p));
+      right = `<div class="pane good"><div class="ph"><b>Proposed fix</b> · dependency upgrade (this line is unchanged; the call is safe on the fixed version) · ${prLink}</div>
+        ${manifest.map((p) => `<div class="small mono" style="padding:6px 12px">${esc(p)}</div>${(files[p] || []).slice(0, 2).map((hh) => sideLines(hh, 'new').replace('class="code"', 'class="code" style="border:0;border-radius:0"')).join('')}`).join('')}</div>`;
+    }
+  } else {
+    const fixed = g?.version_check?.fixed_versions || [];
+    right = `<div class="pane good"><div class="ph"><b>Recommended fix</b> (no automatic PR for this tier)</div>
+      <div style="padding:12px" class="small">${fixed.length ? `Upgrade <code>${esc(g.package?.name)}</code> past the affected range. OSV fix versions: ${fixed.map((v) => `<code>${esc(v)}</code>`).join(' ')}. Check the chosen version against OSV for other advisories.` : esc((f.limitations || [])[0] || 'Human review required.')}</div></div>`;
+  }
+  return `<div class="card" style="margin-top:14px"><h2>Vulnerable code → proposed fix</h2><div class="sbs">${left}${right}</div></div>`;
 }
 
 // ------------------------------------------------------------------------------------------- Page C
@@ -202,7 +449,7 @@ async function pageFinding(run, fid) {
   const gate = f.version_gate || {};
   const sg = f.semgrep;
   const proof = g.proof;
-  const rem = g.remediation;
+  const rem = g.remediation || (d.prior_remediation ? { ...d.prior_remediation, prior: true } : null);
   const sameBlock = sem && (sem.filtered_rows || []).find((r) => r.path === f.path && r.start_line <= f.line && f.line <= r.end_line);
 
   const why = [
@@ -249,7 +496,9 @@ async function pageFinding(run, fid) {
   $app.innerHTML = `
   <div class="row" style="justify-content:space-between;flex-wrap:wrap">
     <div><a href="#/changes?run=${run}" class="small">← changes</a><h1 style="margin-top:4px">${esc(f.path)}:${f.line}</h1>
-      <div class="sub">${tier(f.confidence_tier)} <span class="chip">${esc(f.status)}</span> <span class="chip">${esc(f.finding_type)}</span> scanned at <a target="_blank" href="https://github.com/${esc(d.repo)}/commit/${esc(d.commit_sha)}"><code>${esc(short(d.commit_sha))}</code></a></div></div>
+      <div class="sub">${tier(f.confidence_tier)} <span class="chip">${esc(f.status)}</span> <span class="chip">${esc(f.finding_type)}</span>
+        ${d.issue ? `<a class="chip" style="color:var(--bad)" href="${esc(d.issue.url)}" target="_blank">GitHub issue #${d.issue.number} ↗</a>` : ''}
+        ${d.pr_review && d.pr_review.posted + d.pr_review.already_present ? `<span class="chip">inline PR comments on #${d.pr_review.pr}</span>` : ''} scanned at <a target="_blank" href="https://github.com/${esc(d.repo)}/commit/${esc(d.commit_sha)}"><code>${esc(short(d.commit_sha))}</code></a></div></div>
     <div id="remBtnBox"></div>
   </div>
   <div class="detail">
@@ -270,6 +519,7 @@ async function pageFinding(run, fid) {
       ${f.limitations?.length ? `<h3>Limitations</h3>${f.limitations.map((l) => `<div class="notice small" style="margin-bottom:6px">${esc(l)}</div>`).join('')}` : ''}
     </div>
   </div>
+  ${f.code ? vulnVsFix(d, f, g, rem) : ''}
   <div class="grid g2" style="margin-top:14px">
     <div class="card"><h2>Regression proof (unpatched code @ ${esc(short(d.commit_sha))})</h2>
       ${proof?.run ? `<div class="notice ${proof.status === 'reproduced' ? 'bad' : ''}" style="margin-bottom:10px">${proof.status === 'reproduced'
@@ -294,7 +544,7 @@ async function pageFinding(run, fid) {
     <details><summary>SQL</summary><pre class="sql">${esc(sem.sql)}</pre></details>
     <button class="btn ghost" id="liveVec" style="margin-top:8px">Re-run vector query live</button><div id="liveVecOut"></div></div>` : ''}`;
 
-  if (g.remediable && !rem) {
+  if (g.remediable && !g.remediation && !d.prior_remediation) {
     document.getElementById('remBtnBox').innerHTML = '<button class="btn" id="remBtn">⚙ Prepare verified fix &amp; open draft PR</button>';
     document.getElementById('remBtn').onclick = () => startRemediation(run, f.group_key);
   }
@@ -316,7 +566,7 @@ function remediationView(rem, g) {
         (g.kind === 'vulnerability' && g.version_check?.fixed_versions?.length ? `<p class="small">Fixed versions per OSV: ${g.version_check.fixed_versions.map((v) => `<code>${esc(v)}</code>`).join(' ')}</p>` : '');
   }
   const pr = rem.pr;
-  return `<div class="notice good">Draft PR <a href="${esc(pr.url)}" target="_blank"><b>#${pr.number}</b> ↗</a> on branch <code>${esc(pr.branch)}</code>
+  return `${rem.prior ? `<div class="small muted" style="margin-bottom:6px">PR opened for this same change in earlier run <code>${esc(rem.run_id)}</code> at <code>${esc(short(rem.commit_sha))}</code> (identical finding IDs).</div>` : ''}<div class="notice good">Draft PR <a href="${esc(pr.url)}" target="_blank"><b>#${pr.number}</b> ↗</a> on branch <code>${esc(pr.branch)}</code>
       · executor: <b>${esc(pr.executor === 'guild' ? 'Guild remediation agent' : 'direct GitHub API (disclosed fallback)')}</b>
       ${pr.guild_session_url ? ` · <a href="${esc(pr.guild_session_url)}" target="_blank">Guild trace ↗</a>` : ''}</div>
     <div id="ci" class="small" style="margin:8px 0"><span class="spin"></span> loading CI status…</div>
@@ -397,10 +647,11 @@ async function pageTimeline(run) {
 async function route() {
   clearInterval(POLL);
   const [path, query] = location.hash.slice(1).split('?');
-  const parts = (path || '/repos').split('/').filter(Boolean);
+  const parts = (path || '/overview').split('/').filter(Boolean);
   const params = new URLSearchParams(query || '');
   try {
-    if (parts[0] === 'changes') await pageChanges(params);
+    if (parts[0] === 'overview' || !parts[0]) await pageOverview(params);
+    else if (parts[0] === 'changes') await pageChanges(params);
     else if (parts[0] === 'group') await pageGroup(parts[1], decodeURIComponent(parts.slice(2).join('/')));
     else if (parts[0] === 'finding') {
       await pageFinding(parts[1], parts[2]);

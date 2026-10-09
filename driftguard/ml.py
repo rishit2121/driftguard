@@ -15,7 +15,7 @@ class MLService:
         self.headers = {"Authorization": f"Bearer {token}"} if token else {}
         self.calls: list[dict] = []
 
-    def _post(self, path: str, body: dict, timeout: float = 120.0) -> dict:
+    def _post(self, path: str, body: dict, timeout: float = 45.0) -> dict:
         t0 = time.perf_counter()
         r = httpx.post(f"{self.base_url}{path}", json=body, headers=self.headers, timeout=timeout)
         r.raise_for_status()

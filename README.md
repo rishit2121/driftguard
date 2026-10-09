@@ -29,14 +29,23 @@ authority. Semgrep provides the code-level evidence. Regression tests are the de
   - [#1 Stripe 2025-03-31.basil billing periods, earlier scan `cead8a9`, direct-GitHub fallback](https://github.com/rishit2121/driftguard-demo-monorepo/pull/1). `items.data[0]` was rejected; the plan-item lookup was accepted.
   - [#2 PyYAML CVE-2020-14343](https://github.com/rishit2121/driftguard-demo-monorepo/pull/2). 5.4 and 5.4.1 failed to build and were rejected; 6.0.3 with `safe_load` was accepted.
   - [#3 lodash CVE-2019-10744](https://github.com/rishit2121/driftguard-demo-monorepo/pull/3). A shallow `Object.assign` broke nested defaults and was rejected; 4.18.1 was accepted.
+- GitHub Issues filed automatically for each **confirmed** finding group, deduplicated across re-scans:
+  [#5 Stripe breaking change](https://github.com/rishit2121/driftguard-demo-monorepo/issues/5) (links PR #4),
+  [#6 PyYAML CVE-2020-14343](https://github.com/rishit2121/driftguard-demo-monorepo/issues/6) (links PR #2), and
+  [#7 lodash CVE-2019-10744](https://github.com/rishit2121/driftguard-demo-monorepo/issues/7) (links PR #3).
+  Each Issue has commit-pinned permalinks to the exact Semgrep lines, a syntax-highlighted snippet, the advisory, the tested fix as a ```diff block, and the PR link.
+- Inline PR review comments sit on the exact vulnerable lines: the removed line, LEFT side of the diff ([PR #4 Files changed](https://github.com/rishit2121/driftguard-demo-monorepo/pull/4/files)).
+  For dependency upgrades the call site is not in the diff, so the comment sits on the version bump line (PR #3, `package.json`).
+  GitHub has no custom line colors. The red/green is GitHub's own diff rendering. Check-run annotations would need a GitHub App installation token, so review comments are used instead.
 - Benchmark: `benchmark/run_benchmark.py` in the demo repo. The latest report is in `benchmark/benchmark_report.json`.
 
 ## Screenshots
 
 | | |
 |---|---|
-| ![Repositories](docs/screenshots/a-repositories.png) Connected repository, resolved versions, Stripe API version gates | ![Changes](docs/screenshots/b-advisories.png) Security advisories, sorted by confidence tier |
-| ![Finding](docs/screenshots/c-finding-stripe.png) Finding: official source, pinned code, Semgrep, why-relevant, regression proof, PR + CI | ![Timeline](docs/screenshots/d-timeline.png) Investigation timeline and ClickHouse analytics |
+| ![Overview](docs/screenshots/0-overview.png) **Overview** (demo landing page): sponsor evidence, headline change, proof, rejected and accepted fixes, PRs, Issues, live benchmark | ![Finding](docs/screenshots/c-finding-stripe.png) **Finding**: official source, pinned code, why-relevant, **vulnerable line (red) next to the tested fix (green)**, regression proof, PR + CI |
+| ![Issue](docs/screenshots/e-github-issue.png) **GitHub Issue #5**: permalinks to exact lines, highlighted snippet, advisory, diff fix, PR link | ![PR](docs/screenshots/f-github-pr-inline.png) **PR #4**, opened by the Guild remediator: citations, before/after tests, inline comments on the changed lines |
+| ![Advisories](docs/screenshots/b-advisories.png) Security advisories, sorted by confidence tier | ![Timeline](docs/screenshots/d-timeline.png) Investigation timeline and ClickHouse analytics |
 
 ## Architecture
 
@@ -74,7 +83,7 @@ authority. Semgrep provides the code-level evidence. Regression tests are the de
 | **ClickHouse** | Source snapshot history, code/doc vectors, cosine retrieval, findings, run timeline, query latency | **Live** (ClickHouse 26.10 server; set `CLICKHOUSE_HOST/…` for ClickHouse Cloud) | UI → Investigation: every query shows ClickHouse-reported `elapsed_ms` and `rows_read` |
 | **Akash** | Embedding + ranking inference service | **Live on Akash.** Deployment dseq `1791577117700` on an audited provider (Sweden), 2 CPU / 3Gi, about $0.14/day, bearer-token auth. `/health` reports `deployment: akash`. Akash vectors match the local build (cosine 1.000 on probe texts), so stored embeddings are never mixed across model versions. Typical `/embed` is about 40 ms on the server and about 450 ms round trip from the US. The deployment has a 48-hour spend cap (`runtimeLimitHours`). Extend it or redeploy with `ml_service/deploy.yaml` (the image is built by the `ml-image` workflow). | `/health`, UI header pill, `ml_health`/`ml_rank` timeline stages with model version and latency |
 | **Semgrep** | Code-level localization and security patterns | **Live**: 5 rules, each with `ruleid:`/`ok:` tests (`semgrep --test semgrep-rules`). Scans run on the read-only checkout at the pinned SHA. | Rule YAML + matched expression on every finding |
-| GitHub (action target) | Snapshot by SHA, fix branches, draft PRs, CI | **Live** | PR links + check runs |
+| GitHub (action target) | Snapshot by SHA, fix branches, draft PRs, CI, Issues, inline review comments | **Live** | PR links + check runs, Issues #5–#7, review comments |
 
 ## Results on the demo repository (measured)
 
@@ -129,7 +138,10 @@ uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python -r requirements.txt
 ./scripts/start.sh                                        # ClickHouse + ML service + API/UI on http://127.0.0.1:8080
 ```
 
-Then open http://127.0.0.1:8080 and click **Run full investigation**. On a finding with a reproduced failure, click
+Then open http://127.0.0.1:8080. The **Overview** page is the demo landing screen; click **Run live investigation**.
+A run finishes in about 35 s. The Guild watcher runs concurrently and its trace attaches when Guild finishes (session
+latency varies from about 15 s to over 2 min). Set `DRIFTGUARD_FALLBACK_RUN=<run_id>` to show a previously completed
+genuine run, clearly labeled **RECORDED FALLBACK RUN**, if a live run fails on stage. On a finding with a reproduced failure, click
 **Prepare verified fix & open draft PR**.
 
 CLI:

@@ -99,7 +99,7 @@ def _run(run_id):
 @app.get("/api/investigations/{run_id}")
 def investigation(run_id: str):
     state = _run(run_id)
-    slim = {k: v for k, v in state.items() if k not in ("findings", "groups", "semantic", "proofs", "traceback")}
+    slim = {k: v for k, v in state.items() if k not in ("findings", "groups", "semantic", "proofs", "traceback") and not k.startswith("_")}
     slim["findings"] = [{k: f.get(k) for k in ("finding_id", "group_key", "finding_type", "path", "line", "status", "confidence_tier",
                                                 "change_id", "tab", "model_score", "test_status", "pr_url", "symbol")}
                         for f in state.get("findings", [])]
@@ -137,7 +137,10 @@ def finding(run_id: str, finding_id: str):
     rule = state["semgrep"]["rules"].get((f.get("semgrep") or {}).get("rule_id", ""))
     siblings = [{k: x.get(k) for k in ("finding_id", "path", "line", "status", "confidence_tier")} for x in state["findings"]
                 if x["group_key"] == f["group_key"] and x["finding_id"] != finding_id]
-    return {"finding": f, "group": g, "rule": rule, "siblings": siblings, "repo": state["repo"], "commit_sha": state["commit_sha"],
+    prior = prior_remediation(f["group_key"], run_id) if g and not g.get("remediation") else None
+    report = (state.get("github_reports") or {}).get(f["group_key"]) or {}
+    return {"finding": f, "group": g, "rule": rule, "siblings": siblings, "prior_remediation": prior,
+            "issue": report.get("issue"), "pr_review": report.get("pr_review"), "repo": state["repo"], "commit_sha": state["commit_sha"],
             "semantic": state.get("semantic", {}).get(f["change_id"]), "ml": {k: v for k, v in state.get("ml", {}).items() if k != "calls"},
             "quarantine": state.get("quarantine", [])}
 
@@ -253,3 +256,131 @@ def vector(req: VectorRequest):
     return {"sql": res["filtered"]["sql"], "stats": res["filtered"]["stats"], "rows": rows, "ml_calls": ml.calls,
             "params": {"repo": state["repo"], "sha": state["commit_sha"], "package": g["change"].get("package"),
                        "change_vector": f"Array(Float32)[{len(res['vector'])}] from {ml.calls[0]['model_version'] if ml.calls else '?'}"}}
+
+
+# ----------------------------------------------------------------------------- demo support
+
+_PRIOR_CACHE: dict = {}
+
+
+def prior_remediation(group_key: str, exclude_run: str) -> dict | None:
+    """Most recent remediation (draft PR) for the same change group from an EARLIER run, labeled with its run + SHA."""
+    if group_key in _PRIOR_CACHE:
+        return _PRIOR_CACHE[group_key]
+    rows = store.client().query(
+        "SELECT run_id, commit_sha, summary FROM investigations FINAL WHERE repo={r:String} AND status='complete' "
+        "AND position(summary, '\"remediation\"') > 0 ORDER BY started_at DESC LIMIT 20", parameters={"r": config.DEMO_REPO}).result_rows
+    for run_id, sha, summary in rows:
+        if run_id == exclude_run:
+            continue
+        g = (json.loads(summary).get("groups") or {}).get(group_key) or {}
+        if g.get("remediation"):
+            out = {"run_id": run_id, "commit_sha": sha, **g["remediation"], "proof": g.get("proof")}
+            _PRIOR_CACHE[group_key] = out
+            return out
+    return None
+
+
+def _after_counts(rem):
+    acc = next((a for a in rem.get("attempts", []) if a.get("verdict") == "accepted"), None)
+    cases = ((acc or {}).get("tests") or {}).get("cases", [])
+    return {"pass": sum(c["status"] == "pass" for c in cases), "fail": sum(c["status"] == "fail" for c in cases)} if cases else None
+
+
+def _plan_summary(plan):
+    if not plan:
+        return None
+    return {"current": plan.get("current"), "chosen": plan.get("chosen"), "minimal_fix": plan.get("minimal_fix_for_target"),
+            "minimal_fix_remaining": len(plan.get("minimal_fix_remaining_advisories") or []),
+            "chosen_remaining": len(plan.get("chosen_remaining_advisories") or []), "checked": plan.get("candidates_checked")}
+
+
+def _median(xs):
+    xs = sorted(x for x in xs if x is not None)
+    return xs[len(xs) // 2] if xs else None
+
+
+@app.get("/api/overview")
+def overview(run_id: str | None = None):
+    run_id = run_id or pipeline.latest_run_id(config.DEMO_REPO)
+    state = _run(run_id)
+    groups, findings = state.get("groups", {}), state.get("findings", [])
+    ml = state.get("ml", {})
+    calls = ml.get("calls", [])
+    gw = state.get("guild_watcher") or {}
+    gw_event = next((e for e in state.get("events", []) if e.get("stage") == "guild_watcher"), None)
+    gw_details = json.loads(gw_event["details"]) if gw_event and isinstance(gw_event.get("details"), str) else (gw_event or {}).get("details") or {}
+
+    def group_card(key):
+        g = groups[key]
+        fs = [f for f in findings if f["group_key"] == key]
+        rem = g.get("remediation")
+        source = "this run"
+        if not rem:
+            rem = prior_remediation(key, run_id)
+            source = f"earlier run {rem['run_id']} @ {rem['commit_sha'][:7]}" if rem else None
+        proof = g.get("proof") or {}
+        cases = (proof.get("run") or {}).get("cases", [])
+        return {
+            "issue": ((state.get("github_reports") or {}).get(key) or {}).get("issue"),
+            "group_key": key, "kind": g["kind"], "title": g["change"].get("title"), "change_id": g["change"]["change_id"],
+            "cve": g["change"].get("cve"), "source_url": g["change"]["source_url"], "package": (g.get("package") or {}).get("name"),
+            "installed": (g.get("package") or {}).get("version"),
+            "locations": [{"finding_id": f["finding_id"], "path": f["path"], "line": f["line"], "tier": f["confidence_tier"], "status": f["status"]} for f in fs],
+            "proof": {"status": proof.get("status"), "pass": sum(c["status"] == "pass" for c in cases),
+                      "fail": sum(c["status"] == "fail" for c in cases), "failing": [c["name"] for c in cases if c["status"] == "fail"]},
+            "remediation": {"source": source, "pr": rem.get("pr"), "accepted": rem.get("accepted"),
+                            "attempts": [{k: a.get(k) for k in ("candidate", "description", "verdict", "reason")} for a in rem.get("attempts", [])],
+                            "after": _after_counts(rem), "upgrade_plan": _plan_summary(rem.get("upgrade_plan"))} if rem else None,
+        }
+
+    headline = next((k for k, g in groups.items() if g["kind"] == "breaking_api" and g.get("remediable")), None)
+    security = [k for k, g in groups.items() if g["kind"] == "vulnerability" and any(
+        f["group_key"] == k and f["status"] in ("impacted", "potentially_affected") for f in findings)]
+    sem = (state.get("semantic") or {}).get(groups[headline]["change"]["change_id"]) if headline else None
+    return {
+        "run": {k: state.get(k) for k in ("run_id", "repo", "branch", "commit_sha", "started_at", "finished_at", "duration_ms", "status", "counts")},
+        "fallback_run_id": config.FALLBACK_RUN_ID or None,
+        "headline": group_card(headline) if headline else None,
+        "security": [group_card(k) for k in security],
+        "evidence": {
+            "guild": {"session_url": gw.get("session_url") or gw_details.get("session_url"), "status": gw.get("status"),
+                      "elapsed_s": gw.get("elapsed_s"), "tool_calls": gw.get("tool_calls") or [], "sha_agrees": gw_details.get("sha_agrees"),
+                      "commit_sha": (gw.get("output") or {}).get("commit_sha"), "package_count": (gw.get("output") or {}).get("package_count"),
+                      "stripe_hash_agrees": next((g["change"].get("guild_hash_agrees") for g in groups.values() if g["kind"] == "breaking_api"), None)},
+            "akash": {"health": ml.get("health"), "calls": len(calls), "median_roundtrip_ms": _median([c["roundtrip_ms"] for c in calls]),
+                      "median_server_ms": _median([c.get("server_ms") for c in calls]), "error": ml.get("error")},
+            "clickhouse": {"vector_stats": (sem or {}).get("stats"), "baseline_stats": (sem or {}).get("unfiltered_stats"),
+                           "candidates": len((sem or {}).get("filtered_rows", []))},
+            "semgrep": {k: state.get("semgrep", {}).get(k) for k in ("version", "elapsed_ms", "results")},
+        },
+        "quarantine": state.get("quarantine", []),
+    }
+
+
+@app.get("/api/benchmark")
+def benchmark(run_id: str | None = None):
+    """Score a run with the demo repo's own evaluation harness (benchmark/ at the scanned SHA)."""
+    run_id = run_id or pipeline.latest_run_id(config.DEMO_REPO)
+    state = _run(run_id)
+    src = config.WORK_DIR / "snapshots" / state["repo"].replace("/", "__") / state["commit_sha"] / "benchmark"
+    if not (src / "run_benchmark.py").exists():
+        raise HTTPException(404, "benchmark harness not present at this commit")
+    dest = config.WORK_DIR / "benchmark" / run_id
+    import shutil
+    shutil.rmtree(dest, ignore_errors=True)
+    shutil.copytree(src, dest)
+    proc = subprocess.run(["python3", str(dest / "run_benchmark.py"), "--api", "http://127.0.0.1:8080", "--run", run_id],
+                          capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        raise HTTPException(500, proc.stderr[-800:])
+    report = json.loads((dest / "benchmark_report.json").read_text())
+    report["scenario_titles"] = {}
+    try:
+        import yaml
+        sc = yaml.safe_load((dest / "scenarios.yaml").read_text())
+        report["scenario_titles"] = {s["id"]: s["title"] for s in sc.get("scenarios", [])}
+        report["edge_case_titles"] = {str(k): v for k, v in (sc.get("edge_cases") or {}).items()}
+    except Exception:  # noqa: BLE001
+        pass
+    return report

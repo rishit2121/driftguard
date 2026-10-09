@@ -2,17 +2,71 @@
 regression proof -> (on request) remediation + draft PR."""
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import analysis, codeindex, config, github, guild_bridge, pr, remediation, semgrep_runner, sources, store
+from . import analysis, codeindex, config, github, github_reporting, guild_bridge, pr, remediation, semgrep_runner, sources, store
 from . import inventory as inv_mod
 from .ml import MLService
 from .security import detect_instruction_like
 
 RUNS: dict[str, dict] = {}
+_GUILD_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="guild")
+_ATTACH_LOCK = threading.Lock()
+
+
+def _guild_watch(repo, branch, sha, run_id, log, state):
+    """Runs concurrently with the investigation. Its evidence is attached to the run when Guild finishes, which can be
+    after the platform's own analysis completes (Guild session latency varies widely)."""
+    def created(session_id, url):
+        state["guild_watcher"] = {"session_id": session_id, "session_url": url, "status": "RUNNING"}
+
+    with log.stage("guild_watcher", "guild") as st:
+        try:
+            watch = guild_bridge.run_watcher(repo, branch, on_created=created)
+        except Exception as exc:  # noqa: BLE001 - the platform's own watcher still runs
+            st.result, st.details = "error", {"error": f"{type(exc).__name__}: {exc}"}
+            state["guild_watcher"] = {**(state.get("guild_watcher") or {}), "status": "ERROR", "error": st.details["error"]}
+            _attach_guild(state, None)
+            return None
+        out = watch["output"] or {}
+        st.details = {"session_url": watch["session_url"], "status": watch["status"],
+                      "guild_commit_sha": out.get("commit_sha"), "sha_agrees": out.get("commit_sha") == sha,
+                      "manifests": out.get("manifests"), "package_count": out.get("package_count"),
+                      "affected_packages": [f"{p['name']}@{p['version']}" for p in out.get("affected_packages", [])],
+                      "elapsed_s": watch["elapsed_s"],
+                      "tool_calls": [f"{c['call']} ({c['ms']} ms)" for c in watch.get("tool_calls", [])]}
+        st.result = "ok" if out else "error"
+        for src in out.get("sources", []):
+            store.insert("source_observations", [{
+                "observed_at": store.now(), "provider": src["provider"], "source_url": src["url"],
+                "source_kind": "guild_watcher", "content_sha256": src["sha256"], "change_id": "",
+                "text": f"fetched by Guild session {watch['session_id']} ({src['bytes']} bytes)",
+                "http_status": src["status"], "run_id": run_id}])
+    state["guild_watcher"] = {k: v for k, v in watch.items() if k != "trace"}
+    _attach_guild(state, watch)
+    return watch
+
+
+def _attach_guild(state, watch):
+    """Cross-check Guild's independent fetch against the platform's; re-persist if the run already completed."""
+    with _ATTACH_LOCK:
+        state["_guild_done"] = True
+        if watch and watch.get("output") and state.get("_stripe_changes") is not None:
+            guild_hashes = {x["url"]: x["sha256"] for x in watch["output"].get("sources", [])}
+            for c in state["_stripe_changes"]:
+                c["guild_sha256"] = guild_hashes.get(c["source_url"])
+                c["guild_hash_agrees"] = c["guild_sha256"] == c["content_sha256"]
+                for g in (state.get("groups") or {}).values():
+                    if g["change"].get("change_id") == c["change_id"]:
+                        g["change"]["guild_sha256"], g["change"]["guild_hash_agrees"] = c["guild_sha256"], c["guild_hash_agrees"]
+        if state.get("status") == "complete":
+            _persist_run(state)
+
+
 _LOCK = threading.Lock()
 
 
@@ -62,33 +116,11 @@ def investigate(repo: str, branch: str, run_id: str | None = None, prove: bool =
                           "unverified": inventory["unverified"], "stripe": inventory["stripe"]}
 
     # 2. Source watchers -----------------------------------------------------------------------------
-    guild_watch = None
+    # The Guild watcher session runs concurrently with the platform's own source fetches (independent evidence).
     if config.GUILD_WATCHER_AGENT:
-        with log.stage("guild_watcher", "guild") as st:
-            try:
-                guild_watch = guild_bridge.run_watcher(repo, branch)
-                out = guild_watch["output"] or {}
-                st.details = {"session_url": guild_watch["session_url"], "status": guild_watch["status"],
-                              "guild_commit_sha": out.get("commit_sha"), "sha_agrees": out.get("commit_sha") == sha,
-                              "manifests": out.get("manifests"), "package_count": out.get("package_count"),
-                              "affected_packages": [f"{p['name']}@{p['version']}" for p in out.get("affected_packages", [])],
-                              "elapsed_s": guild_watch["elapsed_s"]}
-                st.result = "ok" if out else "error"
-                for src in out.get("sources", []):
-                    store.insert("source_observations", [{
-                        "observed_at": store.now(), "provider": src["provider"], "source_url": src["url"],
-                        "source_kind": "guild_watcher", "content_sha256": src["sha256"], "change_id": "",
-                        "text": f"fetched by Guild session {guild_watch['session_id']} ({src['bytes']} bytes)",
-                        "http_status": src["status"], "run_id": run_id}])
-            except Exception as exc:  # noqa: BLE001 - the platform's own watcher still runs
-                st.result, st.details = "error", {"error": f"{type(exc).__name__}: {exc}"}
+        state["guild_watcher"] = {"status": "STARTING"}
+        _GUILD_POOL.submit(_guild_watch, repo, branch, sha, run_id, log, state)
     stripe_changes = sources.watch_stripe(run_id, log)
-    if guild_watch and guild_watch.get("output"):
-        guild_hashes = {x["url"]: x["sha256"] for x in guild_watch["output"].get("sources", [])}
-        for c in stripe_changes:
-            c["guild_sha256"] = guild_hashes.get(c["source_url"])
-            c["guild_hash_agrees"] = c["guild_sha256"] == c["content_sha256"]
-    state["guild_watcher"] = {k: v for k, v in (guild_watch or {}).items() if k != "trace"} if guild_watch else None
     shopify_changes = sources.watch_shopify(run_id, log)
     osv_changes = sources.watch_osv(inventory["resolved"], run_id, log)
     with log.stage("source_fetch", "osv_unverified") as st:
@@ -224,6 +256,7 @@ def investigate(repo: str, branch: str, run_id: str | None = None, prove: bool =
                                        "evidence": analysis.dumps(f)} for f in findings])
 
     changes_view = _changes_view(groups, shopify_changes, extra)
+    state["_stripe_changes"] = stripe_changes
     state.update(
         status="complete", finished_at=_now_iso(), duration_ms=round((time.perf_counter() - t_start) * 1000),
         groups={g["key"]: _group_view(g, proofs.get(g["key"])) for g in groups},
@@ -233,8 +266,33 @@ def investigate(repo: str, branch: str, run_id: str | None = None, prove: bool =
         semantic={k: v for k, v in semantic.items() if k in {g["change"]["change_id"] for g in groups}},
         counts=analysis.summarize(findings), proofs=proofs,
     )
-    _persist_run(state)
+    if state.get("_guild_done"):
+        _attach_guild(state, state.get("guild_watcher") if (state.get("guild_watcher") or {}).get("output") else None)
+    else:
+        _persist_run(state)
+    _report_async(state, log)
     return state
+
+
+def _report_async(state, log, group_key=None):
+    """Upsert GitHub Issues / inline PR comments for confirmed findings without delaying the run."""
+    if not config.GITHUB_REPORTS:
+        return
+
+    def work():
+        try:
+            if group_key:
+                sub = {**state, "groups": {group_key: state["groups"][group_key]}}
+                reports = github_reporting.report_run(sub, log)
+            else:
+                reports = github_reporting.report_run(state, log)
+            state.setdefault("github_reports", {}).update(reports)
+        except Exception as exc:  # noqa: BLE001 - reporting must never break an investigation
+            state["github_reports_error"] = f"{type(exc).__name__}: {exc}"
+        with _ATTACH_LOCK:
+            _persist_run(state)
+
+    threading.Thread(target=work, daemon=True).start()
 
 
 def _group_view(g, proof):
@@ -284,7 +342,7 @@ def _top_tier(findings):
 
 
 def _persist_run(state):
-    slim = {k: v for k, v in state.items() if k not in ("events",)}
+    slim = {k: v for k, v in state.items() if k not in ("events",) and not k.startswith("_")}
     store.insert("investigations", [{"started_at": store.now(), "run_id": state["run_id"], "repo": state["repo"],
                                      "branch": state["branch"], "commit_sha": state.get("commit_sha", ""),
                                      "status": state["status"], "summary": analysis.dumps(slim)}])
@@ -400,4 +458,5 @@ def remediate(rem: dict) -> dict:
         {k: v for k, v in a.items() if k != "diff"} for a in result["attempts"]], "accepted": result["accepted"]["candidate"],
         "diff": result["accepted"]["diff"], "upgrade_plan": result.get("upgrade_plan")}
     _persist_run(state)
+    _report_async(state, log, rem["group_key"])
     return rem
