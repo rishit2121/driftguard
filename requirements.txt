@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+httpx
+clickhouse-connect
+pyyaml
+packaging
+pytest
+sentence-transformers
+scikit-learn
+joblib
+numpy

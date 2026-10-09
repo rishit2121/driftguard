@@ -1,0 +1,23 @@
+rules:
+  - id: driftguard.js.lodash-defaultsdeep-prototype-pollution
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      lodash.defaultsDeep merges a caller-supplied object. lodash < 4.17.12 lets a payload containing
+      constructor.prototype pollute Object.prototype (CVE-2019-10744).
+    metadata:
+      change_id: CVE-2019-10744
+      ecosystem: npm
+      package: lodash
+      finding_kind: vulnerable_dependency_use
+      cwe: "CWE-1321: Prototype Pollution"
+      references:
+        - https://osv.dev/vulnerability/CVE-2019-10744
+    pattern-either:
+      - patterns:
+          - pattern-inside: |
+              $L = require('lodash');
+              ...
+          - pattern: $L.defaultsDeep(...)
+      - pattern: require('lodash').defaultsDeep(...)
+      - pattern: require('lodash/defaultsDeep')(...)

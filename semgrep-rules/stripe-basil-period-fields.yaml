@@ -1,0 +1,36 @@
+rules:
+  - id: driftguard.stripe.subscription-period-fields-removed-basil
+    languages: [typescript, javascript]
+    severity: WARNING
+    message: >-
+      Reads Subscription.$FIELD at the subscription level. Stripe API version 2025-03-31.basil removed
+      subscription.current_period_start/current_period_end; on that version and later the value is undefined
+      and must be read from the matching subscription item (items.data[].current_period_*).
+    metadata:
+      change_id: stripe-basil-2025-03-31-periods
+      provider: stripe
+      package: stripe
+      finding_kind: breaking_api
+      symbols: [subscription.current_period_start, subscription.current_period_end]
+      references:
+        - https://docs.stripe.com/changelog/basil/2025-03-31/deprecate-subscription-current-period-start-and-end
+    pattern-either:
+      - patterns:
+          - pattern: '($SUB : Stripe.Subscription).$FIELD'
+          - metavariable-regex:
+              metavariable: $FIELD
+              regex: ^current_period_(start|end)$
+      - patterns:
+          - pattern-inside: |
+              $SUB = $EVENT.data.object as Stripe.Subscription;
+              ...
+          - pattern: $SUB.$FIELD
+          - metavariable-regex:
+              metavariable: $FIELD
+              regex: ^current_period_(start|end)$
+      - patterns:
+          - pattern: |
+              const { ..., $FIELD: $ALIAS, ... } = ($SUB : Stripe.Subscription);
+          - metavariable-regex:
+              metavariable: $FIELD
+              regex: ^current_period_(start|end)$

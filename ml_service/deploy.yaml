@@ -1,0 +1,51 @@
+---
+# Akash SDL v2.0 for the DriftGuard ML inference service.
+# Deploy via Akash Console (https://console.akash.network): Deploy -> "Build your template" / upload SDL -> paste this file.
+# Before deploying: replace ML_SERVICE_TOKEN with a real secret (do not commit it).
+version: "2.0"
+
+services:
+  driftguard-ml:
+    image: ghcr.io/rishit2121/driftguard-ml:0.1.0
+    env:
+      - DEPLOYMENT_TARGET=akash
+      - ML_SERVICE_TOKEN=REPLACE_WITH_LONG_RANDOM_TOKEN
+    expose:
+      - port: 8000 # uvicorn inside the container
+        as: 80 # public port on the provider ingress
+        to:
+          - global: true
+
+profiles:
+  compute:
+    driftguard-ml:
+      resources:
+        cpu:
+          units: 2
+        memory:
+          size: 3Gi
+        storage:
+          size: 6Gi # image is ~2.5GB (CPU torch + baked MiniLM model)
+  placement:
+    dcloud:
+      # Optional: only accept bids from providers audited by the Akash-recognised auditor.
+      # Delete the signedBy block to receive bids from any provider.
+      signedBy:
+        anyOf:
+          - akash1365yvmc4s7awdyj3n2sav7xfx76adc6dnmlx63
+      pricing:
+        driftguard-ml:
+          # Max bid per block (~6s): 1000 uakt/block ~= 14.4 AKT/day ceiling; providers usually bid far lower.
+          denom: uakt
+          amount: 1000
+          # Stable-USD alternative: since the Burn-Mint Equilibrium upgrade (Mar 2026) the docs default to
+          #   denom: uact   (ACT, a USD-pegged compute credit; 1 ACT = 1,000,000 uact)
+          #   amount: 100   (~1.44 ACT/day ceiling)
+          # The older IBC USDC denom (ibc/170C677610AC31DF0904FFE09CD3B5C657492170E7E52372E48756B71E56F2F1)
+          # is no longer accepted by the current SDL schema (denom enum: uakt, uact).
+
+deployment:
+  driftguard-ml:
+    dcloud:
+      profile: driftguard-ml
+      count: 1

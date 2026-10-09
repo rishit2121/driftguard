@@ -1,0 +1,23 @@
+rules:
+  - id: driftguard.java.log4j-nonconstant-log-message
+    languages: [java]
+    severity: WARNING
+    message: >-
+      Log4j call with a non-constant argument. With log4j-core 2.0-beta9 .. 2.14.1 (CVE-2021-44228) attacker
+      influenced strings reaching a logger may trigger JNDI lookups. CANDIDATE use site only: exploitability
+      depends on runtime config, JDK and egress and is not proven by this match.
+    metadata:
+      change_id: CVE-2021-44228
+      ecosystem: Maven
+      package: org.apache.logging.log4j:log4j-core
+      finding_kind: vulnerable_dependency_use
+      confidence_cap: candidate
+      cwe: "CWE-917: Expression Language Injection"
+      references:
+        - https://osv.dev/vulnerability/CVE-2021-44228
+    patterns:
+      - pattern: (org.apache.logging.log4j.Logger $LOG).$METHOD(...)
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: ^(trace|debug|info|warn|error|fatal|log)$
+      - pattern-not: $LOG.$METHOD("...")

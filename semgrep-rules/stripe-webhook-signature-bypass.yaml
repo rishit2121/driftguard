@@ -1,0 +1,22 @@
+rules:
+  - id: driftguard.stripe.webhook-unverified-fallback
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: >-
+      Webhook parser trusts the raw request body when the Stripe-Signature header is missing. Anyone can forge
+      events. Reject requests without a valid signature (stripe.webhooks.constructEvent).
+    metadata:
+      change_id: stripe-webhook-signature-required
+      provider: stripe
+      finding_kind: insecure_code
+      cwe: "CWE-345: Insufficient Verification of Data Authenticity"
+      references:
+        - https://docs.stripe.com/webhooks#verify-events
+    patterns:
+      - pattern-inside: |
+          function $F(...) { ... $STRIPE.webhooks.constructEvent(...); ... }
+      - pattern-either:
+          - pattern: |
+              if (!$SIG) { ... return JSON.parse($BODY) as $T; }
+          - pattern: |
+              if (!$SIG) { ... return JSON.parse($BODY); }

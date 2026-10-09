@@ -1,0 +1,10 @@
+# Runtime deps for the DriftGuard ML service (torch is installed separately from the CPU wheel index; see Dockerfile).
+# numpy is pinned to 2.4.x because numpy 2.5 requires Python >= 3.12 and the image uses python:3.11-slim.
+fastapi==0.143.0
+uvicorn==0.54.0
+sentence-transformers==6.1.0
+transformers==5.19.0
+huggingface-hub==1.33.0
+scikit-learn==1.9.1
+joblib==1.6.0
+numpy==2.4.6

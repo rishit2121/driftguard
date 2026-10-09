@@ -1,0 +1,129 @@
+{
+  "ranker_version": "lr-20261009-b34f6db3",
+  "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+  "data": {
+    "path": "data/pairs.jsonl",
+    "sha256": "b34f6db3ab05c3c0bf5c2ef4d0e78a2476c9d87bd9969a5d7c9b768df3f0187c",
+    "n_total": 104,
+    "n_uncertain_excluded": 14
+  },
+  "split": {
+    "type": "held-out providers",
+    "test_providers": [
+      "jinja2",
+      "log4j",
+      "shopify"
+    ],
+    "n_train": 68,
+    "n_test": 22,
+    "train_positive": 34,
+    "test_positive": 11
+  },
+  "model": "StandardScaler + LogisticRegression(C=1.0, class_weight=balanced, random_state=0); trained on train split only",
+  "decision_threshold_for_metrics": 0.5,
+  "variants": {
+    "full": {
+      "features": [
+        "cosine",
+        "provider_match",
+        "symbol_match",
+        "version_applicable",
+        "semgrep_match",
+        "test_failure"
+      ],
+      "held_out_provider_test": {
+        "accuracy": 0.8636,
+        "precision": 1.0,
+        "recall": 0.7273,
+        "f1": 0.8421,
+        "roc_auc": 0.9752
+      },
+      "leave_one_provider_out_pooled": {
+        "accuracy": 0.8889,
+        "precision": 0.9268,
+        "recall": 0.8444,
+        "f1": 0.8837,
+        "roc_auc": 0.9467
+      }
+    },
+    "no_cosine": {
+      "features": [
+        "provider_match",
+        "symbol_match",
+        "version_applicable",
+        "semgrep_match",
+        "test_failure"
+      ],
+      "held_out_provider_test": {
+        "accuracy": 0.8636,
+        "precision": 1.0,
+        "recall": 0.7273,
+        "f1": 0.8421,
+        "roc_auc": 0.9876
+      },
+      "leave_one_provider_out_pooled": {
+        "accuracy": 0.8778,
+        "precision": 0.925,
+        "recall": 0.8222,
+        "f1": 0.8706,
+        "roc_auc": 0.9091
+      }
+    },
+    "no_semgrep_match": {
+      "features": [
+        "cosine",
+        "provider_match",
+        "symbol_match",
+        "version_applicable",
+        "test_failure"
+      ],
+      "held_out_provider_test": {
+        "accuracy": 0.7273,
+        "precision": 0.7778,
+        "recall": 0.6364,
+        "f1": 0.7,
+        "roc_auc": 0.8347
+      },
+      "leave_one_provider_out_pooled": {
+        "accuracy": 0.7333,
+        "precision": 0.7234,
+        "recall": 0.7556,
+        "f1": 0.7391,
+        "roc_auc": 0.8331
+      }
+    }
+  },
+  "full_model_coefficients_standardized": {
+    "cosine": 0.5566,
+    "provider_match": 0.299,
+    "symbol_match": -0.1877,
+    "version_applicable": 1.2896,
+    "semgrep_match": 1.3034,
+    "test_failure": 1.2046
+  },
+  "uncertain_rows": {
+    "n": 14,
+    "mean_score": 0.3304,
+    "scores": {
+      "stripe-008": 0.2849,
+      "shop-007": 0.205,
+      "gws-005": 0.0038,
+      "twl-005": 0.3455,
+      "gh-006": 0.6758,
+      "aws-007": 0.0174,
+      "yaml-006": 0.8058,
+      "lod-008": 0.7353,
+      "l4j-006": 0.0921,
+      "jj-008": 0.219,
+      "req-006": 0.2586,
+      "exp-007": 0.152,
+      "dj-007": 0.143,
+      "mm-006": 0.6882
+    }
+  },
+  "caveats": [
+    "Small-sample estimate: ~100 hand-written synthetic pairs, test set of ~20 rows; expect wide variance.",
+    "Scores are relevance ranks from logistic regression, NOT calibrated probabilities of exploitability or breakage.",
+    "Explicit features are annotator-assigned, not produced by live scanners."
+  ]
+}

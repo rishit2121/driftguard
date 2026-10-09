@@ -1,0 +1,11 @@
+.venv/
+.work/
+.tools/
+__pycache__/
+*.pyc
+data/snapshots/
+ml_service/server.log
+guild/*/node_modules/
+guild/*/dist/
+guild/*/guild.json
+.env

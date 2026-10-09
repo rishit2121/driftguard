@@ -1,0 +1,18 @@
+name: ci
+on: [push, pull_request, workflow_dispatch]
+permissions: { contents: read }
+jobs:
+  semgrep-rule-tests:
+    runs-on: ubuntu-latest
+    container: semgrep/semgrep:1.180.0
+    steps:
+      - uses: actions/checkout@v4
+      - run: semgrep --test --metrics=off semgrep-rules
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install httpx pyyaml packaging pytest clickhouse-connect fastapi
+      - run: python -m pytest -q tests

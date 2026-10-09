@@ -1,0 +1,4 @@
+node_modules/
+dist/
+guild.json
+agent.js.gz

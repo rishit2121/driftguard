@@ -1,0 +1,23 @@
+{
+  "name": "guild-agent-driftguard-watcher",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "npm run build:compile && npm run build:transform",
+    "build:compile": "tsc --build",
+    "build:transform": "babel ./dist/agent.js --out-dir ./dist --out-file-extension .compiled.js --plugins @guildai/babel-plugin-agent-compiler",
+    "bundle": "npm run build && esbuild dist/agent.compiled.js --bundle --platform=node --format=esm --external:zod --external:@guildai/agents-sdk | gzip | base64 > agent.js.gz"
+  },
+  "dependencies": {
+    "@guildai/agents-sdk": "*",
+    "@guildai-services/guildai~github": "*",
+    "@guildai-services/guildai~experimental-fetch": "*",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@babel/cli": "^7.28.3",
+    "@guildai/babel-plugin-agent-compiler": "*",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.0.0"
+  }
+}

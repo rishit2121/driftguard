@@ -1,0 +1,23 @@
+rules:
+  - id: driftguard.python.pyyaml-full-loader
+    languages: [python]
+    severity: ERROR
+    message: >-
+      yaml FullLoader/full_load on this input. PyYAML < 5.4 FullLoader allows arbitrary code execution on
+      untrusted YAML (CVE-2020-14343). Use yaml.safe_load / SafeLoader for untrusted documents.
+    metadata:
+      change_id: CVE-2020-14343
+      ecosystem: PyPI
+      package: pyyaml
+      finding_kind: vulnerable_dependency_use
+      cwe: "CWE-20: Improper Input Validation"
+      references:
+        - https://nvd.nist.gov/vuln/detail/CVE-2020-14343
+        - https://osv.dev/vulnerability/GHSA-8q59-q68h-6hv4
+    pattern-either:
+      - pattern: yaml.full_load(...)
+      - pattern: yaml.full_load_all(...)
+      - pattern: yaml.load(..., Loader=yaml.FullLoader, ...)
+      - pattern: yaml.load_all(..., Loader=yaml.FullLoader, ...)
+      - pattern: yaml.load(..., Loader=yaml.Loader, ...)
+      - pattern: yaml.load(..., Loader=yaml.UnsafeLoader, ...)
