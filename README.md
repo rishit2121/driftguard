@@ -72,7 +72,7 @@ authority. Semgrep provides the code-level evidence. Regression tests are the de
 |---|---|---|---|
 | **Guild.ai** | Watcher agent (source discovery) and remediator agent (opens the draft PR via Guild's GitHub integration) | **Live.** `rishit.agrawal121~driftguard-watcher` and `~driftguard-remediator` are published in the `driftguard` workspace. Each investigation starts a Guild watcher session that pins the SHA, reads the lockfiles through Guild's GitHub integration, and fetches Stripe/OSV through Guild's fetch tool. Its commit SHA and SHA-256 hashes are cross-checked against the platform's own fetch. [PR #4](https://github.com/rishit2121/driftguard-demo-monorepo/pull/4) was opened by the Guild remediator (`app/guild-ai-platform`). PRs #1–#3 were opened earlier, before Guild was authorized, by the disclosed direct-GitHub fallback. | Guild session links in the timeline, the finding page and the PR body |
 | **ClickHouse** | Source snapshot history, code/doc vectors, cosine retrieval, findings, run timeline, query latency | **Live** (ClickHouse 26.10 server; set `CLICKHOUSE_HOST/…` for ClickHouse Cloud) | UI → Investigation: every query shows ClickHouse-reported `elapsed_ms` and `rows_read` |
-| **Akash** | Embedding + ranking inference service | Container, SDL ([`ml_service/deploy.yaml`](ml_service/deploy.yaml)) and a GHCR build workflow are ready. **Not yet deployed to Akash** (it needs a funded Akash wallet / Console account). Until it is, the same container contract runs locally and the UI labels it `deployment: local`. It is not claimed as Akash-hosted. | `/health.deployment`, UI header pill |
+| **Akash** | Embedding + ranking inference service | **Live on Akash.** Deployment dseq `1791577117700` on an audited provider (Sweden), 2 CPU / 3Gi, about $0.14/day, bearer-token auth. `/health` reports `deployment: akash`. Akash vectors match the local build (cosine 1.000 on probe texts), so stored embeddings are never mixed across model versions. Typical `/embed` is about 40 ms on the server and about 450 ms round trip from the US. The deployment has a 48-hour spend cap (`runtimeLimitHours`). Extend it or redeploy with `ml_service/deploy.yaml` (the image is built by the `ml-image` workflow). | `/health`, UI header pill, `ml_health`/`ml_rank` timeline stages with model version and latency |
 | **Semgrep** | Code-level localization and security patterns | **Live**: 5 rules, each with `ruleid:`/`ok:` tests (`semgrep --test semgrep-rules`). Scans run on the read-only checkout at the pinned SHA. | Rule YAML + matched expression on every finding |
 | GitHub (action target) | Snapshot by SHA, fix branches, draft PRs, CI | **Live** | PR links + check runs |
 
@@ -146,7 +146,7 @@ Configuration (environment variables):
 |---|---|---|
 | `DRIFTGUARD_REPO` / `DRIFTGUARD_BRANCH` | `rishit2121/driftguard-demo-monorepo` / `main` | The only repository the platform will scan or write to |
 | `CLICKHOUSE_HOST/PORT/USER/PASSWORD/SECURE` | `localhost:8123` | Use ClickHouse Cloud by setting `CLICKHOUSE_SECURE=1` |
-| `ML_SERVICE_URL`, `ML_SERVICE_TOKEN` | `http://localhost:8100` | Point at the Akash deployment |
+| `ML_SERVICE_URL`, `ML_SERVICE_TOKEN` | `http://localhost:8100` | Point at the Akash deployment (settings may also be placed in a gitignored `.env`) |
 | `DRIFTGUARD_PR_EXECUTOR` | `github` | `guild` routes PR creation through the Guild remediator agent |
 | `GUILD_REMEDIATOR_AGENT`, `GUILD_WATCHER_AGENT` | – | `owner~agent` names after `guild agent save --publish` |
 
