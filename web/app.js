@@ -220,6 +220,246 @@ async function benchmarkCard(runId) {
   } catch (e) { box.innerHTML = `<summary><h3>Benchmark</h3><span class="muted small">unavailable: ${esc(e.message)}</span></summary>`; }
 }
 
+// ------------------------------------------------------------------------------------------- Live investigation timeline
+let INV_OPEN = null;      // which stage panel is expanded (survives re-render)
+let INV_POLL = null;
+let VEC_LIVE = null;      // result of a live vector re-run (real backend call)
+
+const STAGES = [
+  { id: 'github', icon: 'GH', name: 'GitHub', act: 'Snapshot repo, pin commit, inspect dependencies' },
+  { id: 'guild', icon: 'G', name: 'Guild', act: 'Agent fetches Stripe changelog + OSV advisories' },
+  { id: 'akash', icon: 'A', name: 'Akash', act: '384-d embeddings + relevance scores on the deployed model' },
+  { id: 'clickhouse', icon: 'CH', name: 'ClickHouse', act: 'cosineDistance search over embedded code' },
+  { id: 'semgrep', icon: 'SG', name: 'Semgrep', act: 'Exact files, lines and matched expressions' },
+  { id: 'verify', icon: '✓', name: 'Verification', act: 'API-version gates, regression tests, safe exclusions' },
+  { id: 'actions', icon: 'PR', name: 'GitHub actions', act: 'Issues, inline comments and verified draft PRs' },
+];
+
+function stageStates(L) {
+  const has = (st, pred) => L.events.some((e) => e.stage === st && (!pred || pred(e)));
+  const err = (sts) => L.events.some((e) => sts.includes(e.stage) && e.result === 'error');
+  const done = L.status === 'complete';
+  const g = L.guild.status;
+  return {
+    github: err(['repo_snapshot', 'inventory']) ? 'failed' : has('inventory') ? 'complete' : 'running',
+    guild: g === 'DONE' ? 'complete' : g === 'ERROR' ? 'failed' : ['RUNNING', 'STARTING'].includes(g) ? 'running' : 'waiting',
+    akash: has('ml_unavailable') ? 'failed' : has('ml_rank') || (done && has('ml_health')) ? 'complete' : has('ml_health') || has('source_fetch', (e) => e.provider === 'osv_unverified') ? 'running' : 'waiting',
+    clickhouse: err(['vector_retrieval', 'code_index']) ? 'failed' : has('semgrep') && has('vector_retrieval') ? 'complete' : has('code_index') || has('vector_retrieval') ? 'running' : 'waiting',
+    semgrep: err(['semgrep']) ? 'failed' : has('semgrep') ? 'complete' : has('vector_retrieval') ? 'running' : 'waiting',
+    verify: done ? 'complete' : has('evidence_combine') || has('regression_proof') ? 'running' : 'waiting',
+    actions: L.reports_error ? 'failed' : L.reports ? 'complete' : done ? 'running' : 'waiting',
+  };
+}
+
+const evs = (L, st, pred) => L.events.filter((e) => e.stage === st && (!pred || pred(e)));
+const ms = (v) => (v == null ? '—' : `${Math.round(v)} ms`);
+const sim = (d) => (1 - d).toFixed(3);
+
+function keyOutput(L, id) {
+  const inv = evs(L, 'inventory')[0]?.details || {};
+  const ov = L.overview;
+  switch (id) {
+    case 'github': return evs(L, 'repo_snapshot')[0] ? `<code>${esc(short(evs(L, 'repo_snapshot')[0].details.commit_sha))}</code> pinned · ${inv.packages ?? '…'} packages · ${(inv.languages || []).length || '…'} languages` : 'resolving branch → commit SHA…';
+    case 'guild': {
+      const g = L.guild;
+      if (g.status === 'DONE') return `${g.tool_calls.length} tool calls · ${g.sources.map((s) => new URL(s.url).hostname).join(' + ')} · <a href="${esc(g.session_url)}" target="_blank" onclick="event.stopPropagation()">session ↗</a>`;
+      if (g.session_url) return `agent running in Guild (non-blocking) · <a href="${esc(g.session_url)}" target="_blank" onclick="event.stopPropagation()">watch session ↗</a>`;
+      return g.status === 'ERROR' ? esc(g.error || 'session failed') : 'starting Guild session…';
+    }
+    case 'akash': {
+      const h = evs(L, 'ml_health')[0]?.details;
+      const n = L.events.filter((e) => e.provider === 'akash').length;
+      const med = ov?.evidence?.akash?.median_server_ms;
+      return h ? `deployment <b>${esc(h.deployment)}</b> · ${L.ml_calls ? L.ml_calls.length : n} inference calls${med != null ? ` · ${ms(med)} median server` : ''}` : 'connecting…';
+    }
+    case 'clickhouse': {
+      const v = evs(L, 'vector_retrieval');
+      const first = v[0]?.details;
+      return first ? `${v.length} vector queries · ${first.elapsed_ms} ms · ${first.rows_read} rows read · package = <code>${esc(first.package)}</code>` : 'waiting for embeddings…';
+    }
+    case 'semgrep': {
+      const s = evs(L, 'semgrep')[0]?.details;
+      return s ? `${s.results} matches in ${s.elapsed_ms} ms · e.g. <code>${esc((s.matches || []).find((m) => m.includes('subscription.ts')) || s.matches?.[0] || '')}</code>` : '…';
+    }
+    case 'verify': {
+      const p = evs(L, 'regression_proof');
+      const h = ov?.headline;
+      if (h) return `<span class="fail">${h.proof.fail} FAIL</span> before → <span class="pass">${h.remediation?.after ? `${h.remediation.after.pass}/${h.remediation.after.pass + h.remediation.after.fail} PASS` : '—'}</span> after · acacia endpoint excluded`;
+      return p.length ? `${p.filter((e) => e.result === 'reproduced').length}/${p.length} regressions reproduced…` : '…';
+    }
+    case 'actions': {
+      if (!L.reports) return L.status === 'complete' ? 'updating GitHub (background)…' : 'after verification';
+      const vals = Object.values(L.reports);
+      const created = vals.filter((v) => v.issue?.action === 'created').length;
+      return `${vals.length} issues (${created ? `${created} created now` : 'already filed earlier'}) · ${vals.reduce((a, v) => a + (v.pr_review?.posted || 0), 0)} new inline comments`;
+    }
+  }
+  return '';
+}
+
+function vectorViz(L) {
+  const S = L.stripe;
+  if (!S) return '<div class="muted small">Available when the run completes.</div>';
+  const sem = VEC_LIVE && VEC_LIVE.run === L.run.run_id ? { filtered_rows: VEC_LIVE.rows, stats: VEC_LIVE.stats } : S.semantic;
+  const stripeFindings = L.findings.filter((f) => f.group_key === S.group_key).sort((a, b) => (b.model_score || 0) - (a.model_score || 0));
+  const inBlock = (r) => stripeFindings.find((f) => f.path === r.path && f.line >= r.start_line && f.line <= r.end_line);
+  const filteredKeys = new Set((S.semantic.filtered_rows || []).map((r) => `${r.path}:${r.start_line}`));
+  const doc = evs(L, 'doc_index')[0]?.details || {};
+  const h = L.overview?.evidence?.akash?.health || {};
+  const excluded = (S.semantic.unfiltered_rows || []).filter((r) => !filteredKeys.has(`${r.path}:${r.start_line}`));
+  return `<div class="vv">
+    <div class="vv-l">
+      <div class="k">1 · Official change → Akash</div>
+      <div class="vv-card"><div class="fw">${esc(S.change.title)}</div>
+        <div class="small muted">Removed: ${(S.change.removed_symbols || []).map((x) => `<code>${esc(x)}</code>`).join(' ')}</div>
+        <div class="small" style="margin-top:6px">Embedded by <b>Akash</b> · <code>${esc(h.embedding_model || doc.embedding_model || '')}</code> · ${esc(h.embedding_dim || 384)}-d · pod <code>${esc((h.host || '').slice(-11))}</code></div></div>
+      <div class="k" style="margin-top:12px">Akash ranker relevance (real scores)</div>
+      ${stripeFindings.map((f) => `<div class="bar-row"><span class="mono small">${esc(shortPath(f.path))}:${f.line}</span>
+        <div class="sbar"><div class="${f.tier === 'confirmed' ? 'g' : 'a'}" style="width:${Math.round((f.model_score || 0) * 100)}%"></div></div>
+        <span class="mono small">${(f.model_score ?? 0).toFixed(3)}</span></div>`).join('')}
+      <div class="small muted" style="margin-top:6px">Relevance rank from the trained ranker, not a probability.</div>
+    </div>
+    <div class="vv-r">
+      <div class="k">2 · ClickHouse nearest code ${VEC_LIVE && VEC_LIVE.run === L.run.run_id ? '<span class="badge-live">RE-RUN LIVE</span>' : ''}</div>
+      <div class="small muted">WHERE repo, commit, <b>package = 'stripe'</b> · ORDER BY cosineDistance · ${esc(sem.stats?.elapsed_ms)} ms · ${esc(sem.stats?.rows_read)} rows read
+        ${VEC_LIVE && VEC_LIVE.run === L.run.run_id ? ` · Akash embed ${esc(VEC_LIVE.embed_ms)} ms` : ''}</div>
+      <table class="clean vt"><tr><th>#</th><th>Code block</th><th>Distance</th><th>Similarity</th><th>Then</th></tr>
+      ${(sem.filtered_rows || []).map((r, i) => { const f = inBlock(r); return `<tr class="${f ? (f.tier === 'confirmed' ? 'hl-g' : 'hl-a') : ''}"><td>${i + 1}</td>
+        <td class="mono small">${esc(shortPath(r.path))}:${r.start_line} <span class="muted">${esc(r.symbol)}</span></td><td class="mono">${r.distance.toFixed(4)}</td><td class="mono">${sim(r.distance)}</td>
+        <td class="small">${f ? (f.tier === 'confirmed' ? '<span class="pass">Semgrep ✓ confirmed</span>' : '<span class="tag amber">upgrade risk</span>') : '<span class="muted">not promoted</span>'}</td></tr>`; }).join('')}
+      </table>
+      ${excluded.length ? `<div class="k" style="margin-top:10px">Similar-looking, excluded by the package filter</div>
+        ${excluded.slice(0, 3).map((r) => `<div class="small"><span class="tag amber">excluded</span> <span class="mono">${esc(shortPath(r.path))}:${r.start_line} ${esc(r.symbol)}</span> <span class="muted">distance ${r.distance.toFixed(4)} · no Stripe import</span></div>`).join('')}` : ''}
+      <button class="btn ghost" id="vecLive" style="margin-top:10px">↻ Re-run vector query live</button>
+    </div>
+  </div>
+  <div class="vv-foot"><span>Semantic similarity <b>finds candidates</b></span><span class="arr">→</span><span>API-version gate</span><span class="arr">+</span><span>Semgrep exact match</span><span class="arr">+</span><span>regression tests</span><span class="arr">=</span><span><b>finding</b></span></div>`;
+}
+
+function stagePanel(L, id) {
+  const ov = L.overview;
+  const done = L.status === 'complete';
+  switch (id) {
+    case 'github': {
+      const r = evs(L, 'repo_snapshot')[0]?.details || {};
+      const inv = evs(L, 'inventory')[0]?.details || {};
+      return `<div class="kv2"><div>Repository</div><div><a href="${esc(r.url)}" target="_blank">${esc(r.repo)} ↗</a> · branch <code>${esc(r.branch)}</code></div>
+        <div>Pinned commit</div><div><a href="${esc(r.url)}/commit/${esc(r.commit_sha)}" target="_blank"><code>${esc(r.commit_sha)}</code> ↗</a></div>
+        <div>Dependencies</div><div>${esc(inv.packages)} packages · ${esc(inv.resolved)} resolved from lockfiles/exact pins · unverified: ${(inv.unverified || []).map((x) => `<code>${esc(x)}</code>`).join(' ') || 'none'}</div>
+        <div>Languages</div><div>${(inv.languages || []).map(esc).join(', ')}</div>
+        <div>Stripe API version</div><div>${Object.entries(inv.stripe_api_versions || {}).map(([a, v]) => `<code>${esc(a)}</code> → <code>${esc(v)}</code>`).join(' ')}</div></div>`;
+    }
+    case 'guild': {
+      const g = L.guild;
+      const own = evs(L, 'source_fetch', (e) => e.provider === 'stripe')[0]?.details;
+      return `<div class="kv2"><div>Session</div><div>${g.session_url ? `<a href="${esc(g.session_url)}" target="_blank">${esc(g.session_url.split('/').pop())} ↗</a>` : '—'} · ${esc(g.status || 'not started')}${g.elapsed_s ? ` · ${esc(g.elapsed_s)} s end-to-end` : ''}${g.agent_runtime_s ? ` (agent ${esc(g.agent_runtime_s)} s)` : ''}</div>
+        ${g.status !== 'DONE' ? `<div>Status</div><div class="muted">The agent is pinning the commit, reading lockfiles via Guild GitHub, and fetching Stripe + OSV. Its sources and tool calls appear here when the session finishes; the investigation does not wait for it.</div>
+          <div>Independent cross-check</div><div>${own ? `Platform's own changelog fetch: sha256 <code>${esc((own.sha256 || '').slice(0, 12))}</code>` : '—'}</div></div>` : ''}
+        ${g.status !== 'DONE' ? '' : `<div>Pinned by agent</div><div>${g.commit_sha ? `<code>${esc(short(g.commit_sha))}</code> ${g.commit_sha === L.run.commit_sha ? '<span class="pass">matches platform snapshot</span>' : ''}` : '—'} · ${esc(g.package_count ?? '—')} packages from ${(g.manifests || []).length} manifests</div>
+        <div>Sources fetched by Guild</div><div>${g.sources.map((s) => `<div><code>${esc(s.status)}</code> ${esc(s.url)} · ${esc(s.bytes)} bytes · sha256 <code>${esc((s.sha256 || '').slice(0, 12))}</code></div>`).join('') || '—'}</div>
+        <div>Independent cross-check</div><div>${own ? `Platform fetched the same changelog: sha256 <code>${esc((own.sha256 || '').slice(0, 12))}</code> ${L.stripe?.change?.guild_hash_agrees ? '<span class="pass">identical</span>' : ''}` : '—'}</div>
+        <div>Tool calls</div><div><ol class="calls">${g.tool_calls.map((c) => `<li>${esc(c.call)}${c.ms != null ? ` <span class="muted">${c.ms} ms</span>` : ''}</li>`).join('')}</ol></div></div>`}`;
+    }
+    case 'akash': {
+      const h = evs(L, 'ml_health')[0]?.details || {};
+      const by = (ep) => (L.ml_calls || []).filter((c) => c.endpoint === ep);
+      const rows = ['/embed', '/rank', '/classify'].map((ep) => { const c = by(ep); return c.length ? `<div><code>POST ${ep}</code></div><div>${c.length} calls · ${c.reduce((a, x) => a + (x.n || 0), 0)} items · server ${c.map((x) => Math.round(x.server_ms || 0)).join(', ')} ms</div>` : ''; }).join('');
+      return `<div class="kv2"><div>Endpoint</div><div><code>${esc(h.url || '')}</code> · deployment <b>${esc(h.deployment)}</b> · pod <code>${esc(h.host)}</code></div>
+        <div>Model</div><div><code>${esc(h.embedding_model)}</code> (${esc(h.embedding_dim)}-d) + ranker <code>${esc(h.ranker_version)}</code> · version <code>${esc(h.model_version)}</code></div>
+        <div>Health round trip</div><div>${ms(h.roundtrip_ms)}</div>
+        ${rows || `<div>Calls</div><div>${evs(L, 'doc_index')[0] ? `${esc(evs(L, 'doc_index')[0].details.new_chunks)} change chunks embedded` : 'running…'}</div>`}</div>
+        <div class="small muted" style="margin-top:6px">Relevance scores per code location are in the ClickHouse stage view.</div>`;
+    }
+    case 'clickhouse': return vectorViz(L);
+    case 'semgrep': {
+      const s = evs(L, 'semgrep')[0]?.details || {};
+      const f = L.findings || [];
+      return `<div class="small muted">${esc(s.results)} matches · ${esc(s.elapsed_ms)} ms · Semgrep ${esc(s.version)} · 5 tested rules</div>
+        <table class="clean"><tr><th>Location</th><th>Rule</th><th>Matched expression</th><th>Tier</th></tr>
+        ${(f.length ? f : []).filter((x) => x.rule_id).map((x) => `<tr class="click" onclick="location.hash='#/finding/${esc(L.run.run_id)}/${esc(x.finding_id)}'"><td class="mono small">${esc(x.path)}:${x.line}</td>
+          <td class="mono small muted">${esc((x.rule_id || '').replace('driftguard.', ''))}</td><td class="mono small">${esc(x.matched)}</td><td>${tier(x.tier)}</td></tr>`).join('')
+          || (s.matches || []).map((m) => `<tr><td class="mono small" colspan="4">${esc(m)}</td></tr>`).join('')}</table>`;
+    }
+    case 'verify': {
+      const h = ov?.headline;
+      const st = (L.findings || []).filter((x) => x.group_key === L.stripe?.group_key);
+      const proofs = evs(L, 'regression_proof');
+      return `<div class="vgrid">
+        <div><div class="k">API-version gate (per code path)</div>${st.map((x) => `<div class="small"><span class="mono">${esc(shortPath(x.path))}:${x.line}</span> receives <code>${esc((x.gate.rule || '').split(' ')[0])}</code> → ${x.gate.affected ? '<span class="fail">affected</span>' : '<span class="tag amber">upgrade risk</span>'}</div>`).join('') || '…'}</div>
+        <div><div class="k">Regression tests on unpatched code</div>${proofs.map((e) => `<div class="small"><code>${esc(e.details.playbook)}</code>: <span class="fail">${(e.details.failing || []).length} FAIL</span> / ${e.details.cases} cases · ${esc(e.result)}</div>`).join('') || '…'}
+          ${h?.remediation?.after ? `<div class="small" style="margin-top:6px">Stripe fix: <span class="pass">${h.remediation.after.pass}/${h.remediation.after.pass + h.remediation.after.fail} PASS</span> <span class="muted">(${esc(h.remediation.source)})</span></div>` : ''}</div>
+        <div><div class="k">Correctly excluded</div>
+          ${st.filter((x) => x.tier === 'upgrade_risk').map((x) => `<div class="small"><span class="mono">${esc(shortPath(x.path))}:${x.line}</span>: pinned to <code>acacia</code>, not broken today</div>`).join('')}
+          ${(L.safe_exclusions || []).map((u) => `<div class="small"><span class="mono">${esc(shortPath(u.path))}:${u.line}</span> ${esc(u.symbol)}: ${esc(u.why)}</div>`).join('')}
+          ${(L.stripe?.semantic?.unfiltered_rows || []).filter((r) => r.path.endsWith('unused-field.ts')).map((r) => `<div class="small"><span class="mono">${esc(shortPath(r.path))}:${r.start_line}</span>: look-alike <code>current_period_end</code>, no Stripe type/import</div>`).join('')}</div>
+      </div>`;
+    }
+    case 'actions': {
+      const groups = ov ? [ov.headline, ...(ov.security || [])].filter(Boolean) : [];
+      const rep = L.reports || {};
+      const issueTxt = (a) => ({ created: 'created by this run', updated: 'updated by this run (filed earlier)', unchanged: 'filed by an earlier run · unchanged' }[a] || a);
+      return groups.length ? `<table class="clean"><tr><th>Finding</th><th>Issue</th><th>Inline PR comments</th><th>Draft PR (verified patch)</th></tr>
+        ${groups.map((g) => { const r = rep[g.group_key] || {}; const rem = g.remediation; return `<tr><td class="small"><b>${esc(g.cve || 'Stripe basil')}</b></td>
+          <td class="small">${r.issue ? `<a href="${esc(r.issue.url)}" target="_blank">#${r.issue.number} ↗</a> <span class="muted">${esc(issueTxt(r.issue.action))}</span>` : (done ? '<span class="muted">confirmed findings only</span>' : '…')}</td>
+          <td class="small">${r.pr_review ? `${r.pr_review.posted} posted now · ${r.pr_review.already_present} already present` : '—'}</td>
+          <td class="small">${rem ? `<a href="${esc(rem.pr.url)}" target="_blank">#${rem.pr.number} ↗</a> <span class="muted">${rem.source === 'this run' ? 'opened by this run' : 'opened by ' + esc(rem.source)} · ${rem.pr.executor === 'guild' ? 'Guild remediator' : 'direct GitHub fallback'}</span>` : '<span class="muted">no auto-fix (candidate)</span>'}</td></tr>`; }).join('')}</table>
+        <div class="small muted" style="margin-top:6px">PRs are only opened from a verified patch; this run did not open new PRs unless marked "opened by this run".</div>` : '<div class="muted small">After verification completes.</div>';
+    }
+  }
+  return '';
+}
+
+function renderTimeline(L) {
+  const box = document.getElementById('inv');
+  if (!box) return;
+  const S = stageStates(L);
+  const nDone = Object.values(S).filter((x) => x === 'complete').length;
+  const running = L.status === 'running';
+  const secs = L.run.started_at ? Math.max(0, Math.round(((running ? Date.now() : new Date(L.run.finished_at)) - new Date(L.run.started_at)) / 1000)) : 0;
+  box.innerHTML = `<div class="inv-head">
+      <div><h3>Live investigation</h3><div class="small muted">${running ? `<span class="badge-live">RUNNING NOW</span>` : runBadge(L.run)} <code>${esc(L.run.run_id)}</code> · ${secs}s · ${L.events.length} measured events · click a stage for evidence</div></div>
+      <div class="inv-prog"><div style="width:${Math.round((nDone / STAGES.length) * 100)}%"></div></div>
+    </div>
+    <div class="stages">${STAGES.map((st, i) => `<div class="stage ${S[st.id]} ${INV_OPEN === st.id ? 'open' : ''}" data-st="${st.id}">
+      <div class="sh"><span class="si">${S[st.id] === 'complete' ? '✓' : S[st.id] === 'failed' ? '!' : st.icon}</span>
+        <div class="sb"><div class="sn2">${i + 1}. ${st.name} <span class="sstate">${S[st.id] === 'running' ? '<span class="spin"></span> running' : S[st.id]}</span></div>
+          <div class="sact">${st.act}</div><div class="sout">${keyOutput(L, st.id)}</div></div>
+        <span class="chev">${INV_OPEN === st.id ? '▾' : '▸'}</span></div>
+      ${INV_OPEN === st.id ? `<div class="spanel">${stagePanel(L, st.id)}</div>` : ''}</div>`).join('')}</div>`;
+  box.querySelectorAll('.stage .sh').forEach((el) => {
+    el.onclick = () => { const id = el.parentElement.dataset.st; INV_OPEN = INV_OPEN === id ? null : id; renderTimeline(L); };
+  });
+  const vb = document.getElementById('vecLive');
+  if (vb) vb.onclick = async () => {
+    vb.disabled = true; vb.innerHTML = '<span class="spin"></span> querying Akash + ClickHouse…';
+    const r = await post('/api/sql/vector', { run_id: L.run.run_id, change_id: L.overview?.headline?.change_id });
+    VEC_LIVE = { run: L.run.run_id, rows: r.rows, stats: r.stats, embed_ms: r.ml_calls?.[0]?.roundtrip_ms };
+    renderTimeline(L);
+  };
+}
+
+async function watchTimeline(runId, onComplete) {
+  clearInterval(INV_POLL);
+  let wasRunning = false;
+  const tick = async () => {
+    let L;
+    try { L = await api(`/api/investigations/${encodeURIComponent(runId)}/live`); } catch (e) { return; }
+    if (L.status === 'running') wasRunning = true;
+    if (wasRunning && L.status !== 'running' && onComplete) { wasRunning = false; onComplete(L); }
+    if (document.querySelector('#inv .spanel #vecLive:disabled')) return; // don't clobber an in-flight live query
+    renderTimeline(L);
+    const settled = L.status !== 'running' && !['RUNNING', 'STARTING'].includes(L.guild.status) && (L.reports || L.reports_error || L.status === 'error');
+    if (settled) clearInterval(INV_POLL);
+    return L;
+  };
+  const first = await tick();
+  if (first && !(first.status !== 'running' && !['RUNNING', 'STARTING'].includes(first.guild.status) && (first.reports || first.reports_error))) {
+    INV_POLL = setInterval(tick, 1500);
+  }
+  return first;
+}
+
+
 async function pageOverview(params) {
   setNav('overview');
   const o = await api(`/api/overview${params.get('run') ? '?run_id=' + encodeURIComponent(params.get('run')) : ''}`);
@@ -240,13 +480,17 @@ async function pageOverview(params) {
     </div>
     <button class="btn big" id="liveRun">▶ Run live investigation</button>
   </section>
-  <div id="liveBox" class="livebox"></div>
-  ${heroMetrics(inv, o)}
-  ${featured(run, o.headline)}
-  ${findingsTable(run, o.security)}
-  ${evidencePanel(o, run)}
-  <details class="panel evidence" id="bench"><summary><h3>Benchmark</h3><span class="muted small"><span class="spin"></span> scoring…</span></summary></details>`;
+  <section id="inv" class="panel inv"></section>
+  <div id="ovBody">
+    <div id="staleNote"></div>
+    ${heroMetrics(inv, o)}
+    ${featured(run, o.headline)}
+    ${findingsTable(run, o.security)}
+    ${evidencePanel(o, run)}
+    <details class="panel evidence" id="bench"><summary><h3>Benchmark</h3><span class="muted small"><span class="spin"></span> scoring…</span></summary></details>
+  </div>`;
   document.getElementById('liveRun').onclick = startLiveFromOverview;
+  watchTimeline(run.run_id);
   benchmarkCard(run.run_id);
   const pr = o.headline?.remediation?.pr;
   if (pr) {
@@ -257,42 +501,26 @@ async function pageOverview(params) {
       document.getElementById('ciFull').innerHTML = `<a href="${esc(pr.url)}/checks" target="_blank">${esc(txt)} checks passing ↗</a> · ${st.draft ? 'draft' : ''} · ${st.merged ? 'merged' : 'not merged'}`;
     }).catch(() => { document.getElementById('ciMini').textContent = 'CI n/a'; });
   }
-  if (['RUNNING', 'STARTING'].includes(o.evidence.guild.status)) {
-    POLL = setInterval(async () => {
-      const fresh = await api(`/api/overview?run_id=${encodeURIComponent(run.run_id)}`);
-      if (!['RUNNING', 'STARTING'].includes(fresh.evidence.guild.status)) { clearInterval(POLL); route(); }
-    }, 4000);
-  }
 }
 
 async function startLiveFromOverview() {
   const btn = document.getElementById('liveRun');
   btn.disabled = true;
-  btn.innerHTML = '<span class="spin"></span> Investigating…';
+  btn.innerHTML = '<span class="spin"></span> Investigating live…';
   const { run_id } = await post('/api/investigations', {});
   RUN = run_id;
-  const box = document.getElementById('liveBox');
-  box.classList.add('on');
-  const t0 = Date.now();
-  clearInterval(POLL);
-  POLL = setInterval(async () => {
-    const ev = await api(`/api/investigations/${run_id}/events`);
-    const secs = Math.round((Date.now() - t0) / 1000);
-    const last = ev.events[ev.events.length - 1];
-    const pct = Math.min(96, Math.round((ev.events.length / EXPECTED_STAGES) * 100));
-    const done = new Set(ev.events.map((e) => e.stage));
-    box.innerHTML = `<div class="lb-row"><span class="spin"></span><b>${esc(last ? (STAGE_LABEL[last.stage] || last.stage) : 'Starting')}</b>
-        <span class="muted">${last ? esc(last.provider) + ' · ' + last.duration_ms + ' ms' : ''}</span><span class="grow"></span>
-        <span class="muted mono">${secs}s · ${ev.events.length} measured events · <code>${esc(run_id)}</code></span></div>
-      <div class="lb-bar"><div style="width:${pct}%"></div></div>
-      <div class="lb-stages">${['repo_snapshot', 'source_fetch', 'guild_watcher', 'code_index', 'vector_retrieval', 'semgrep', 'regression_proof', 'ml_rank'].map((s) =>
-        `<span class="${done.has(s) ? 'done' : ''}">${esc(STAGE_LABEL[s])}</span>`).join('')}</div>`;
-    if (ev.status !== 'running') {
-      clearInterval(POLL);
-      if (ev.status === 'complete') location.hash = `#/overview?run=${run_id}`;
-      else box.innerHTML += `<div class="notice bad">Live run failed: ${esc(ev.error)}. ${FALLBACK ? `<a href="#/overview?run=${esc(FALLBACK)}">Open the recorded fallback run</a>` : ''}</div>`;
+  VEC_LIVE = null;
+  const body = document.getElementById('ovBody');
+  body.classList.add('stale');
+  document.getElementById('staleNote').innerHTML = '<div class="stale-note">Below: results of the previous run. They refresh when the live run completes.</div>';
+  document.getElementById('inv').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  watchTimeline(run_id, (L) => {
+    if (L.status === 'complete') location.hash = `#/overview?run=${run_id}`;
+    else {
+      btn.disabled = false; btn.textContent = '▶ Run live investigation';
+      document.getElementById('staleNote').innerHTML = `<div class="notice bad">Live run failed: ${esc(L.error || '')}. ${FALLBACK ? `<a href="#/overview?run=${esc(FALLBACK)}">Open the recorded fallback run</a>` : ''}</div>`;
     }
-  }, 1200);
+  });
 }
 
 // ------------------------------------------------------------------------------------------- Page A
@@ -717,6 +945,7 @@ async function pageTimeline(run) {
 // ------------------------------------------------------------------------------------------- router
 async function route() {
   clearInterval(POLL);
+  clearInterval(INV_POLL);
   const [path, query] = location.hash.slice(1).split('?');
   const parts = (path || '/overview').split('/').filter(Boolean);
   const params = new URLSearchParams(query || '');

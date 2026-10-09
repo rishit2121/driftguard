@@ -384,3 +384,59 @@ def benchmark(run_id: str | None = None):
     except Exception:  # noqa: BLE001
         pass
     return report
+
+
+@app.get("/api/investigations/{run_id}/live")
+def live(run_id: str):
+    """Read-only snapshot of a run for the live investigation timeline (works while running and after)."""
+    state = _run(run_id)
+    events = [{**e, "event_at": str(e["event_at"]),
+               "details": json.loads(e["details"]) if isinstance(e["details"], str) and e["details"].startswith("{") else e["details"]}
+              for e in state.get("events", [])]
+    gw = state.get("guild_watcher") or {}
+    gout = gw.get("output") or {}
+    out = {
+        "status": state.get("status"), "error": state.get("error"), "fallback_run_id": config.FALLBACK_RUN_ID or None,
+        "run": {k: state.get(k) for k in ("run_id", "repo", "branch", "commit_sha", "started_at", "finished_at", "duration_ms")},
+        "events": events,
+        "guild": {"status": gw.get("status"), "session_url": gw.get("session_url"), "elapsed_s": gw.get("elapsed_s"),
+                  "agent_runtime_s": gw.get("agent_runtime_s"), "error": gw.get("error"),
+                  "tool_calls": [c if isinstance(c, dict) else {"call": c} for c in gw.get("tool_calls") or []],
+                  "commit_sha": gout.get("commit_sha"), "package_count": gout.get("package_count"), "manifests": gout.get("manifests"),
+                  "sources": [{k: s.get(k) for k in ("provider", "url", "status", "sha256", "bytes")} for s in gout.get("sources", [])],
+                  "affected_packages": [f"{p['name']}@{p['version']}" for p in gout.get("affected_packages", [])]},
+        "reports": state.get("github_reports"), "reports_error": state.get("github_reports_error"),
+    }
+    if state.get("status") != "complete":
+        return out
+    ov = overview(run_id)
+    out["overview"] = {k: ov[k] for k in ("headline", "security", "evidence")}
+    groups = state.get("groups", {})
+    key = next((k for k, g in groups.items() if g["kind"] == "breaking_api"), None)
+    if key:
+        g = groups[key]
+        sem = (state.get("semantic") or {}).get(g["change"]["change_id"]) or {}
+        out["stripe"] = {
+            "group_key": key, "change": {k: g["change"].get(k) for k in ("title", "api_version", "removed_symbols", "added_symbols", "source_url",
+                                                                         "content_sha256", "guild_sha256", "guild_hash_agrees", "source_mode")},
+            "hard_filter": g.get("hard_filter"), "semantic": {k: sem.get(k) for k in ("filtered_rows", "unfiltered_rows", "stats", "unfiltered_stats", "sql")},
+        }
+    sel = {k for k, g in groups.items() if any(f["group_key"] == k and f["confidence_tier"] in ("confirmed", "candidate", "upgrade_risk")
+                                              for f in state["findings"])}
+    out["findings"] = [{"finding_id": f["finding_id"], "group_key": f["group_key"], "path": f["path"], "line": f["line"], "tier": f["confidence_tier"],
+                        "status": f["status"], "model_score": f.get("model_score"), "rule_id": (f.get("semgrep") or {}).get("rule_id"),
+                        "matched": (f.get("semgrep") or {}).get("matched_code", "").strip()[:160],
+                        "gate": {k: (f.get("version_gate") or {}).get(k) for k in ("rule", "basis", "affected", "api_version")}}
+                       for f in state["findings"] if f["group_key"] in sel and f["status"] != "exposed"]
+    hits = [(f["path"], f["line"]) for f in out["findings"]]
+    seen, safe = set(), []
+    for g in groups.values():
+        for u in g.get("non_matching_uses", []):
+            k = (u["path"], u["start_line"])
+            if k in seen or any(p == u["path"] and u["start_line"] <= ln < u["start_line"] + 10 for p, ln in hits):
+                continue
+            seen.add(k)
+            safe.append({"path": u["path"], "line": u["start_line"], "symbol": u["symbol"], "why": u["verdict"]})
+    out["safe_exclusions"] = safe
+    out["ml_calls"] = [{k: c.get(k) for k in ("endpoint", "roundtrip_ms", "server_ms", "n")} for c in (state.get("ml") or {}).get("calls", [])]
+    return out
