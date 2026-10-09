@@ -4,9 +4,12 @@ permissions: { contents: read }
 jobs:
   semgrep-rule-tests:
     runs-on: ubuntu-latest
-    container: semgrep/semgrep:1.180.0
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      # pip instead of the Docker image: avoids Docker Hub anonymous pull rate limits
+      - run: pip install semgrep==1.180.0
       - run: semgrep --test --metrics=off semgrep-rules
   unit:
     runs-on: ubuntu-latest
