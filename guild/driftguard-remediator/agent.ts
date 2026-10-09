@@ -20,8 +20,25 @@ const tools = {
 };
 type Tools = typeof tools;
 
+function treeEntries(paths: string[], files: Record<string, string | null>, blobs: { sha: string }[]) {
+  let i = 0;
+  return paths.map((p) => ({ path: p, mode: '100644' as const, type: 'blob' as const, sha: files[p] === null ? null : blobs[i++].sha }));
+}
+
+function blobPaths(files: Record<string, string | null>) {
+  return Object.keys(files).filter((p) => files[p] !== null);
+}
+
+// Chat sessions may wrap the prompt with a preamble; the request is the outermost JSON object in the text.
+function parseRequest(text: string) {
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start < 0 || end < start) throw new Error('expected a JSON request in the prompt');
+  return JSON.parse(text.slice(start, end + 1));
+}
+
 async function run(input: Input, task: Task<Tools>): Promise<Output> {
-  const req = JSON.parse(input.text);
+  const req = parseRequest(input.text);
   const allowed = task.env.DRIFTGUARD_ALLOWED_REPO;
   if (req.repo !== allowed) throw new Error(`refusing to write to ${req.repo}: only ${allowed} is authorized`);
   if (!String(req.branch).startsWith('driftguard/')) throw new Error('fix branches must live under driftguard/');
@@ -29,12 +46,9 @@ async function run(input: Input, task: Task<Tools>): Promise<Output> {
 
   const base = await task.tools.github_git_get_commit({ owner, repo, commit_sha: req.base_sha });
   const paths = Object.keys(req.files);
-  const blobs = await task.gather(paths.filter((p) => req.files[p] !== null).map((p) =>
+  const blobs = await task.gather(blobPaths(req.files).map((p) =>
     task.tools.github_git_create_blob({ owner, repo, content: req.files[p], encoding: 'utf-8' })));
-  let i = 0;
-  const entries = paths.map((p) => req.files[p] === null
-    ? { path: p, mode: '100644', type: 'blob', sha: null }
-    : { path: p, mode: '100644', type: 'blob', sha: blobs[i++].sha });
+  const entries = treeEntries(paths, req.files, blobs);
   const tree = await task.tools.github_git_create_tree({ owner, repo, base_tree: base.tree.sha, tree: entries });
   const commit = await task.tools.github_git_create_commit({ owner, repo, message: req.title, tree: tree.sha, parents: [req.base_sha],
     author: { name: 'DriftGuard Bot (Guild)', email: 'driftguard-bot@users.noreply.github.com' } });
@@ -52,6 +66,7 @@ async function run(input: Input, task: Task<Tools>): Promise<Output> {
 }
 
 export default agent({
+  identifier: 'driftguard-remediator',
   description: 'DriftGuard remediator: commits an already-verified patch to a driftguard/* branch and opens a draft PR (never merges)',
   inputSchema, outputSchema, tools, run,
 });

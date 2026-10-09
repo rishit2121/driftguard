@@ -2,6 +2,19 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _load_dotenv(path: Path, prefixes=("DRIFTGUARD_", "GUILD_", "ML_SERVICE_", "CLICKHOUSE_")):
+    """Load only DriftGuard settings from .env (other secrets in that file are never read into the process)."""
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        key, sep, value = line.strip().partition("=")
+        if sep and key.startswith(prefixes) and key not in os.environ:
+            os.environ[key] = value.strip().strip('"')
+
+
+_load_dotenv(ROOT / ".env")
 DATA_DIR = ROOT / "data"
 SNAPSHOT_DIR = DATA_DIR / "snapshots"
 WORK_DIR = Path(os.environ.get("DRIFTGUARD_WORKDIR", ROOT / ".work"))

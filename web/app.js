@@ -137,6 +137,10 @@ async function pageChanges(params) {
   $app.innerHTML = `
   <h1>Upstream changes</h1>
   <p class="sub">Run <a href="#/timeline/${run}"><code>${esc(run)}</code></a> · ${esc(inv.repo)} @ <code>${esc(short(inv.commit_sha))}</code> · ${fmtTime(inv.finished_at)} · ${Math.round((inv.duration_ms || 0) / 1000)}s</p>
+  ${inv.guild_watcher ? `<div class="notice good" style="margin-bottom:12px">Guild watcher session <a href="${esc(inv.guild_watcher.session_url)}" target="_blank">${esc(inv.guild_watcher.session_id)} ↗</a>
+    · ${esc(inv.guild_watcher.status)} in ${esc(inv.guild_watcher.elapsed_s)}s · pinned <code>${esc(short((inv.guild_watcher.output || {}).commit_sha))}</code>
+    ${(inv.guild_watcher.output || {}).commit_sha === inv.commit_sha ? '(agrees with platform snapshot)' : '<b>(SHA differs from platform snapshot)</b>'}
+    · ${esc((inv.guild_watcher.output || {}).package_count)} packages via Guild GitHub integration</div>` : ''}
   <div class="tabs">${TABS.map(([k, l]) => `<a class="tab ${k === active ? 'active' : ''}" href="#/changes?run=${run}&tab=${k}">${l}<span class="n">${count(k)}</span></a>`).join('')}</div>
   <div class="card"><table>
     <tr><th></th><th>Change</th><th>Installed / versions</th><th>Published</th><th>Source</th><th>Confidence</th><th>Affected</th><th>Action</th></tr>
@@ -232,7 +236,8 @@ async function pageFinding(run, fid) {
       <div>Removed</div><div>${(c.removed_symbols || []).map((s) => `<code>${esc(s)}</code>`).join('<br>')}</div>
       <div>Replacement</div><div>${(c.added_symbols || []).map((s) => `<code>${esc(s)}</code>`).join('<br>')}</div>
       <div>Fetched</div><div class="small">${fmtTime(c.fetched_at)} · HTTP ${esc(c.http_status)} · <b>${esc(c.source_mode)}</b></div>
-      <div>Content hash</div><div class="small mono">${esc((c.content_sha256 || '').slice(0, 16))}… (${esc(c.observation_state)})</div></div>
+      <div>Content hash</div><div class="small mono">${esc((c.content_sha256 || '').slice(0, 16))}… (${esc(c.observation_state)})</div>
+      ${c.guild_sha256 ? `<div>Guild fetch</div><div class="small">${c.guild_hash_agrees ? '<span class="pass">same sha256</span>' : '<span class="fail">different sha256</span>'} via Guild watcher</div>` : ''}</div>
       <a href="${esc(c.source_url || f.source_url)}" target="_blank">${esc(c.source_url || f.source_url)} ↗</a>
       <h3>Official source (highlighted)</h3><div class="src">${highlight(srcText, terms)}</div>
       ${(c.quarantined_instructions || []).length ? '<div class="notice">Instruction-like text in this source was quarantined.</div>' : ''}`;

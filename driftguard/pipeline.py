@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import analysis, codeindex, config, github, pr, remediation, semgrep_runner, sources, store
+from . import analysis, codeindex, config, github, guild_bridge, pr, remediation, semgrep_runner, sources, store
 from . import inventory as inv_mod
 from .ml import MLService
 from .security import detect_instruction_like
@@ -62,7 +62,33 @@ def investigate(repo: str, branch: str, run_id: str | None = None, prove: bool =
                           "unverified": inventory["unverified"], "stripe": inventory["stripe"]}
 
     # 2. Source watchers -----------------------------------------------------------------------------
+    guild_watch = None
+    if config.GUILD_WATCHER_AGENT:
+        with log.stage("guild_watcher", "guild") as st:
+            try:
+                guild_watch = guild_bridge.run_watcher(repo, branch)
+                out = guild_watch["output"] or {}
+                st.details = {"session_url": guild_watch["session_url"], "status": guild_watch["status"],
+                              "guild_commit_sha": out.get("commit_sha"), "sha_agrees": out.get("commit_sha") == sha,
+                              "manifests": out.get("manifests"), "package_count": out.get("package_count"),
+                              "affected_packages": [f"{p['name']}@{p['version']}" for p in out.get("affected_packages", [])],
+                              "elapsed_s": guild_watch["elapsed_s"]}
+                st.result = "ok" if out else "error"
+                for src in out.get("sources", []):
+                    store.insert("source_observations", [{
+                        "observed_at": store.now(), "provider": src["provider"], "source_url": src["url"],
+                        "source_kind": "guild_watcher", "content_sha256": src["sha256"], "change_id": "",
+                        "text": f"fetched by Guild session {guild_watch['session_id']} ({src['bytes']} bytes)",
+                        "http_status": src["status"], "run_id": run_id}])
+            except Exception as exc:  # noqa: BLE001 - the platform's own watcher still runs
+                st.result, st.details = "error", {"error": f"{type(exc).__name__}: {exc}"}
     stripe_changes = sources.watch_stripe(run_id, log)
+    if guild_watch and guild_watch.get("output"):
+        guild_hashes = {x["url"]: x["sha256"] for x in guild_watch["output"].get("sources", [])}
+        for c in stripe_changes:
+            c["guild_sha256"] = guild_hashes.get(c["source_url"])
+            c["guild_hash_agrees"] = c["guild_sha256"] == c["content_sha256"]
+    state["guild_watcher"] = {k: v for k, v in (guild_watch or {}).items() if k != "trace"} if guild_watch else None
     shopify_changes = sources.watch_shopify(run_id, log)
     osv_changes = sources.watch_osv(inventory["resolved"], run_id, log)
     with log.stage("source_fetch", "osv_unverified") as st:

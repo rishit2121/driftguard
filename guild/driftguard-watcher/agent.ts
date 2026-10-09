@@ -53,40 +53,76 @@ function packagesFrom(path: string, text: string) {
   return out;
 }
 
+type Pkg = ReturnType<typeof packagesFrom>[number];
+
+function osvQuery(packages: Pkg[]) {
+  return { queries: packages.map((p) => ({ package: { ecosystem: p.ecosystem, name: p.name }, version: p.version })) };
+}
+
+function affectedPackages(json: unknown, packages: Pkg[]) {
+  const results = (json as { results?: { vulns?: { id: string }[] }[] } | undefined)?.results ?? [];
+  return results
+    .map((r, i) => Object.assign({}, packages[i], { vulns: (r.vulns ?? []).map((v) => v.id) }))
+    .filter((r) => r.vulns.length > 0);
+}
+
+function observation(provider: string, url: string, status: number, body: unknown) {
+  const text = typeof body === 'string' ? body : JSON.stringify(body);
+  return { provider, url, status, sha256: sha256Hex(text), bytes: text.length, fetched_at: new Date().toISOString() };
+}
+
+function lockfilePaths(tree: { tree?: { type?: string; path?: string }[] }) {
+  return (tree.tree ?? [])
+    .filter((n) => n.type === 'blob' && LOCKFILES.test(n.path ?? '') && !(n.path ?? '').includes('node_modules/'))
+    .map((n) => n.path as string);
+}
+
+function allowedChangelogUrls(urls: string[] | undefined) {
+  return (urls ?? []).filter((u) => ALLOWED_HOSTS.includes(new URL(u).hostname));
+}
+
+function report(req: { repo: string; branch: string }, sha: string, manifests: string[], packages: Pkg[], osv: unknown[], sources: unknown[]) {
+  return JSON.stringify({ repo: req.repo, branch: req.branch, commit_sha: sha, manifests, package_count: packages.length,
+    affected_packages: osv, sources });
+}
+
+// Chat sessions may wrap the prompt with a preamble; the request is the outermost JSON object in the text.
+function parseRequest(text: string) {
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start < 0 || end < start) throw new Error('expected a JSON request in the prompt');
+  return JSON.parse(text.slice(start, end + 1));
+}
+
 async function run(input: Input, task: Task<Tools>): Promise<Output> {
-  const req = JSON.parse(input.text);
+  const req = parseRequest(input.text);
   const [owner, repo] = String(req.repo).split('/');
   const branch = await task.tools.github_repos_get_branch({ owner, repo, branch: req.branch ?? 'main' });
   const sha: string = branch.commit.sha;
   await task.console.info(`Pinned ${req.repo}@${req.branch} to ${sha}`);
 
   const tree = await task.tools.github_git_get_tree({ owner, repo, tree_sha: sha, recursive: 'true' });
-  const manifests = (tree.tree ?? []).filter((n: any) => n.type === 'blob' && LOCKFILES.test(n.path) && !n.path.includes('node_modules/'));
-  const contents = await task.gather(manifests.map((n: any) => task.tools.github_repos_get_content({ owner, repo, path: n.path, ref: sha })));
-  const packages = contents.flatMap((c: any, i: number) => packagesFrom(manifests[i].path, decode(c.content)));
+  const manifests = lockfilePaths(tree as never);
+  const contents = await task.gather(manifests.map((path) => task.tools.github_repos_get_content({ owner, repo, path, ref: sha })));
+  const packages = contents.flatMap((c: any, i: number) => packagesFrom(manifests[i], decode(c.content)));
 
-  const sources = [];
-  for (const url of req.stripe_changelog_urls ?? []) {
-    if (!ALLOWED_HOSTS.includes(new URL(url).hostname)) continue;
-    const res = await task.tools.experimental_fetch_fetch({ url: `${url}.md`, method: 'GET', timeout_seconds: 20 });
-    const text = res.text ?? JSON.stringify(res.json);
-    sources.push({ provider: 'stripe', url, status: res.status_code, sha256: sha256Hex(text), bytes: text.length, fetched_at: new Date().toISOString() });
+  const sources: unknown[] = [];
+  for (const url of allowedChangelogUrls(req.stripe_changelog_urls)) {
+    const res = await task.tools.experimental_fetch_fetch({ url: url + '.md', method: 'GET', timeout_seconds: 20 });
+    sources.push(observation('stripe', url, res.status_code, res.text ?? res.json));
   }
   const osvRes = await task.tools.experimental_fetch_fetch({
-    url: 'https://api.osv.dev/v1/querybatch', method: 'POST', timeout_seconds: 30, headers: { 'Content-Type': 'application/json' },
-    data: JSON.stringify({ queries: packages.map((p) => ({ package: { ecosystem: p.ecosystem, name: p.name }, version: p.version })) }),
+    url: 'https://api.osv.dev/v1/querybatch', method: 'POST', timeout_seconds: 30, data: osvQuery(packages),
   });
-  const osv = (osvRes.json?.results ?? []).map((r: any, i: number) => ({ ...packages[i], vulns: (r.vulns ?? []).map((v: any) => v.id) }))
-    .filter((r: any) => r.vulns.length);
-  sources.push({ provider: 'osv', url: 'https://api.osv.dev/v1/querybatch', status: osvRes.status_code,
-    sha256: sha256Hex(JSON.stringify(osvRes.json)), bytes: JSON.stringify(osvRes.json).length, fetched_at: new Date().toISOString() });
+  const osv = affectedPackages(osvRes.json, packages);
+  sources.push(observation('osv', 'https://api.osv.dev/v1/querybatch', osvRes.status_code, osvRes.json));
 
   await task.console.info(`${packages.length} resolved packages, ${osv.length} with advisories`);
-  return { type: 'text', text: JSON.stringify({ repo: req.repo, branch: req.branch, commit_sha: sha, manifests: manifests.map((m: any) => m.path),
-    package_count: packages.length, affected_packages: osv, sources }) };
+  return { type: 'text', text: report(req, sha, manifests, packages, osv, sources) };
 }
 
 export default agent({
+  identifier: 'driftguard-watcher',
   description: 'DriftGuard watcher: pins a repo to a commit SHA, inventories lockfiles, fetches official changelogs and OSV advisories, returns hashed observations',
   inputSchema, outputSchema, tools, run,
 });

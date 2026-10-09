@@ -41,42 +41,51 @@ def _json(text: str):
         return lines[-1] if lines else {}
 
 
+TERMINAL = {"DONE", "ERROR", "FAILED", "CANCELLED", "COMPLETED"}
+
+
 def run_session(agent: str, payload: dict, timeout_s: int = 900) -> dict:
+    """Create a Guild session for `agent`, wait for its root task, and return its output + trace."""
+    t0 = time.time()
     created = _json(_guild("session", "create", "--agent", agent, "--prompt", json.dumps(payload)))
-    session_id = created.get("id") or created.get("session", {}).get("id")
-    deadline = time.time() + timeout_s
+    session_id = created["id"]
     info = created
-    while time.time() < deadline:
+    while time.time() - t0 < timeout_s:
         info = _json(_guild("session", "get", session_id))
-        status = (info.get("root_task") or {}).get("status") or info.get("status")
-        if status in ("completed", "complete", "succeeded", "failed", "error", "cancelled"):
+        if str((info.get("root_task") or {}).get("status", "")).upper() in TERMINAL:
             break
-        time.sleep(5)
-    events = _json(_guild("session", "events", session_id, "--events", "all", "--limit", "200"))
-    return {"session_id": session_id, "session_url": info.get("session_url") or created.get("session_url"), "info": info, "events": events}
-
-
-def _final_output(session: dict) -> dict:
-    blob = json.dumps(session["info"]) + json.dumps(session["events"])
-    m = re.findall(r'\\?"pr_url\\?"\s*:\s*\\?"(https://github\.com/[^"\\]+)', blob)
-    out = {"url": m[-1] if m else None}
-    n = re.findall(r"/pull/(\d+)", out["url"] or "")
-    out["number"] = int(n[0]) if n else None
-    return out
+        time.sleep(4)
+    events = _json(_guild("session", "events", session_id, "--limit", "100")).get("items", [])
+    output, errors, trace = None, [], []
+    for e in events:
+        kind = e.get("entity_type", "")
+        data = (e.get("content") or {}).get("data") if isinstance(e.get("content"), dict) else None
+        trace.append({"type": kind, "at": e.get("created_at"), "data": (data or "")[:400] if isinstance(data, str) else data})
+        if kind == "EntEventAgentNotificationMessage" and isinstance(data, str):
+            try:
+                output = json.loads(data)
+            except json.JSONDecodeError:
+                pass
+        if "Error" in kind:
+            errors.append(data)
+    return {"session_id": session_id, "session_url": info.get("session_url") or created.get("session_url"),
+            "status": (info.get("root_task") or {}).get("status"), "output": output, "errors": errors, "trace": trace,
+            "elapsed_s": round(time.time() - t0, 1)}
 
 
 def open_pr(repo, base_sha, base_branch, branch, title, body, files) -> dict:
     if not config.GUILD_REMEDIATOR_AGENT:
         raise RuntimeError("GUILD_REMEDIATOR_AGENT is not configured")
-    payload = {"type": "text", "text": json.dumps({"repo": repo, "base_sha": base_sha, "base_branch": base_branch, "branch": branch,
-                                                   "title": title, "body": body, "files": files, "draft": True})}
+    payload = {"repo": repo, "base_sha": base_sha, "base_branch": base_branch, "branch": branch,
+               "title": title, "body": body, "files": files}
     session = run_session(config.GUILD_REMEDIATOR_AGENT, payload)
-    out = _final_output(session)
-    if not out["url"]:
-        raise RuntimeError(f"Guild remediator session {session['session_id']} returned no PR URL")
-    return {**out, "draft": True, "guild_session_id": session["session_id"], "guild_session_url": session["session_url"]}
+    out = session["output"] or {}
+    if not out.get("pr_url"):
+        raise RuntimeError(f"Guild remediator session {session['session_url']} returned no PR: {session['errors'][:2]}")
+    return {"url": out["pr_url"], "number": out["number"], "draft": True, "head_sha": out.get("commit_sha"),
+            "guild_session_id": session["session_id"], "guild_session_url": session["session_url"], "guild_trace": session["trace"]}
 
 
 def run_watcher(repo: str, branch: str) -> dict:
-    payload = {"type": "text", "text": json.dumps({"repo": repo, "branch": branch, "stripe_changelog_urls": config.STRIPE_CHANGELOG_URLS})}
-    return run_session(config.GUILD_WATCHER_AGENT, payload)
+    return run_session(config.GUILD_WATCHER_AGENT, {"repo": repo, "branch": branch,
+                                                    "stripe_changelog_urls": config.STRIPE_CHANGELOG_URLS})
